@@ -1,0 +1,17 @@
+
+function triangle(n) -> begin
+  let i = 0;
+  while i < n do begin
+    let j = 0;
+    while j < 2 * n do begin
+      if j >= n - i & j <= n + i
+      then print("*")
+      else print(" ");
+      j <- j + 1;
+    end;
+    print("\n");
+    i <- i + 1;
+  end;
+end;
+
+triangle(4);
