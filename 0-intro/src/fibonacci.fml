@@ -1,0 +1,18 @@
+function fib(n) -> begin
+  let a = 1;
+  let b = 1;
+  let i = 0;
+  while i < n do begin
+    let t = a;
+    a <- b;
+    b <- t + b;
+    i <- i + 1;
+  end;
+  a
+end;
+
+let i = 0;
+while i < 8 do begin
+  print("~ ~\n", i, fib(i));
+  i <- i + 1;
+end

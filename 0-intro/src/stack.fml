@@ -1,0 +1,39 @@
+let nil = object begin
+  let is_nil = true;
+end;
+
+function cons(x, xs) -> object begin
+  let x  = x;
+  let xs = xs;
+  let is_nil = false;
+end;
+
+function new_stack() -> object begin
+  let storage = nil;
+  function push(x) -> this.storage <- cons(x, this.storage);
+  function pop() -> if false == this.storage.is_nil then begin
+    let t = this.storage.x;
+    this.storage <- this.storage.xs;
+    t
+  end;
+  function peek() -> if false == this.storage.is_nil then begin
+    this.storage.x
+  end;
+end;
+
+let stack = new_stack();
+print("stack.peek() = ~\n", stack.peek());
+print("stack.push(1)\n");
+stack.push(1);
+print("stack.peek() = ~\n", stack.peek());
+print("stack.push(2)\n");
+stack.push(2);
+print("stack.push(3)\n");
+stack.push(3);
+print("stack.peek() = ~\n", stack.peek());
+print("stack.pop()  = ~\n", stack.pop());
+print("stack.pop()  = ~\n", stack.pop());
+print("stack.peek() = ~\n", stack.peek());
+print("stack.pop()  = ~\n", stack.pop());
+print("stack.pop()  = ~\n", stack.pop());
+print("stack.peek() = ~\n", stack.peek());
