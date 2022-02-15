@@ -1,3 +1,13 @@
+let n_bases = 7;
+let bases = begin
+  let i = 0;
+  let base = 1;
+  array(n_bases, begin
+    let b = base * (if i % 2 == 0 then 1 else begin base <- base * 10; 5 end);
+    i <- i + 1; b
+  end)
+end;
+
 function write_roman_digit(b) ->
   if      b == 0 then print("I")
   else if b == 1 then print("V")
@@ -13,36 +23,27 @@ function awaken(n) -> object extends n begin
   function print_roman() -> begin
     let n = this.n;
 
-    let n_bases = 7;
-    let bases = begin
-      let i = 0;
-      let base = 1;
-      array(n_bases, begin
-        let b = base * (if i % 2 == 0 then 1 else begin base <- base * 10; 5 end);
-        i <- i + 1; b
-      end)
-    end;
-
     let b = n_bases - 1;
-    let start = false;
     while b >= 0 & n > 0 do begin
       let base = bases[b];
-      start <- start | (n >= base)| true;
+
+      // find the number to subtract from the current "base"
+      // (I in IV, C in CD, X in XL(II), etc.), I call it
+      // the predecessor (pred)
+
       let break = false;
-      if start & b > 0 then begin
-        let b2 = 0;
-        while n < base & false == break & b2 < b do begin
-          let pred = bases[b2];
-          if base != 2 * pred & n >= base - pred then begin
-            n <- n - base + pred;
-            write_roman_digit(b2);
-            write_roman_digit(b);
-            break <- true;
-          end;
-          b2 <- b2 + 1;
+      let b_pred = 0;
+      while b > 0 & n < base & false == break & b_pred < b do begin
+        let pred = bases[b_pred];
+        if base != 2 * pred & n >= base - pred then begin
+          n <- n - base + pred;
+          write_roman_digit(b_pred);
+          write_roman_digit(b);
+          break <- true;
         end;
+        b_pred <- b_pred + 1;
       end;
-      if start & false == break then
+      if false == break then
         while n >= base do begin
           n <- n - base;
           write_roman_digit(b);
