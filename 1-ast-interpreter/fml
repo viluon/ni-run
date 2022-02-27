@@ -1,0 +1,8 @@
+#!/bin/bash
+if [ "$1" = "run" ]
+then
+    $PARSER parse "$2" --format=json | target/release/interpreter
+else
+    echo "Unknown command: $1. Supported commands: run"
+    exit 1
+fi
