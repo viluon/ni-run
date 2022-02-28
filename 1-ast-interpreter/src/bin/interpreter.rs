@@ -1,10 +1,74 @@
-use std::{io::Read, collections::BTreeMap, fmt::Display};
+#![feature(fn_traits, associated_type_defaults)]
+
+use std::{io::Read, collections::BTreeMap, fmt::Display, rc::Rc};
 use anyhow::Result;
 
 use fml_ast_interpreter::*;
-use ast::{*};
+use state::*;
+use ast::*;
 
-// derive display
+// the state monad adapted for errors with short-circuiting
+pub enum Either<A, B> { Left(A), Right(B) }
+pub struct ErrorState<'a, E, S, A> {
+    pub run_error_state: Box<dyn FnOnce(S) -> Either<E, (A, S)> + 'a>
+}
+
+impl<'a, E, S, A> ErrorState<'a, E, S, A> where E: 'a, S: 'a, A: 'a {
+    pub fn flat_map<B, F>(self, f: F) -> ErrorState<'a, E, S, B>
+    where F: Fn(A) -> ErrorState<'a, E, S, B> + 'a {
+        ErrorState {
+            run_error_state: Box::new(move |first_state| {
+                match self.run_error_state.call_once((first_state,)) {
+                    Either::Left(err) => Either::Left(err),
+                    Either::Right((result, next_state)) => f(result).run_error_state.call_once((next_state,))
+                }
+            })
+        }
+    }
+
+    pub fn map<B, F>(self, f: F) -> ErrorState<'a, E, S, B>
+    where F: Fn(A) -> B + 'a, B: 'a {
+        self.flat_map(move |a| ErrorState::pure(f(a)))
+    }
+
+    pub fn pure(a: A) -> ErrorState<'a, E, S, A> {
+        ErrorState {
+            run_error_state: Box::new(move |s| {
+                Either::Right((a, s))
+            })
+        }
+    }
+
+    pub fn error(e: E) -> ErrorState<'a, E, S, A> {
+        ErrorState {
+            run_error_state: Box::new(move |_| {
+                Either::Left(e)
+            })
+        }
+    }
+}
+
+impl<'a, E, S> ErrorState<'a, E, S, S> where S: Clone {
+    pub fn get() -> ErrorState<'a, E, S, S> {
+        ErrorState {
+            run_error_state: Box::new(move |s| {
+                Either::Right((s.clone(), s))
+            })
+        }
+    }
+}
+
+impl<'a, E, S> ErrorState<'a, E, S, ()> where S: 'a {
+    pub fn put(s: S) -> ErrorState<'a, E, S, ()> {
+        ErrorState {
+            run_error_state: Box::new(move |_| {
+                Either::Right(((), s))
+            })
+        }
+    }
+}
+
+
 #[derive(Debug, Clone)]
 enum Value {
     Int(i32),
@@ -24,159 +88,184 @@ impl Display for Value {
     }
 }
 
-#[derive(Clone)]
-enum Interpreter<T> {
-    Valid {result: T, env: BTreeMap<Identifier, usize>, heap: BTreeMap<usize, Value>},
-    Err {msg: String},
+#[derive(Debug, Default, Clone)]
+struct InterpreterState {
+    env: BTreeMap<Identifier, usize>,
+    heap: BTreeMap<usize, Value>,
 }
 
-impl Interpreter<usize> {
-    fn alloc(v: Value) -> Interpreter<usize> {
-        Interpreter::Valid { result: 0, env: BTreeMap::new(), heap: BTreeMap::new() }.fast_alloc(v)
-    }
-}
-
-impl Interpreter<()> {
-    fn set_env(env: BTreeMap<Identifier, usize>) -> Interpreter<()> {
-        Interpreter::Valid { result: (), env, heap: BTreeMap::new() }
-    }
-
-    fn set_heap(heap: BTreeMap<usize, Value>) -> Interpreter<()> {
-        Interpreter::Valid { result: (), env: BTreeMap::new(), heap }
-    }
-}
-
-impl<A> Interpreter<A> where A: Clone {
-    fn ret(result: A) -> Interpreter<A> {
-        Interpreter::Valid {result, env: BTreeMap::new(), heap: BTreeMap::new()}
-    }
-
-    fn fast_ret<B>(&self, result: B) -> Interpreter<B> {
-        match (*self).clone() {
-            Interpreter::Valid {result: _, env, heap} => Interpreter::Valid {result, env, heap},
-            Interpreter::Err {msg} => Interpreter::Err {msg},
-        }
-    }
-
-    fn crash(msg: String) -> Interpreter<A> {
-        Interpreter::Err { msg }
-    }
-
-    fn lift<B>(self, f: fn(A) -> Result<B>) -> Interpreter<B> {
-        match self {
-            Interpreter::Valid { result, env, heap } => {
-                match f(result) {
-                    Ok(b) => Interpreter::Valid { result: b, env, heap },
-                    Err(e) => Interpreter::Err { msg: e.to_string() },
-                }
-            },
-            Interpreter::Err { msg } => Interpreter::Err { msg },
-        }
-    }
-
-    fn map<F, B>(self, f: F) -> Interpreter<B> where F: FnOnce(A) -> B {
-        match self {
-            Interpreter::Valid { result, env, heap } => Interpreter::Valid { result: f(result), env, heap },
-            Interpreter::Err { msg } => Interpreter::Err { msg },
-        }
-    }
-
-    fn flat_map<F, B>(self, f: F) -> Interpreter<B> where F: FnOnce(A) -> Interpreter<B> {
-        match self {
-            Interpreter::Valid { result, mut env, mut heap } => {
-                match f(result) {
-                    Interpreter::Valid {
-                        result: b,
-                        env: next_env,
-                        heap: next_heap
-                    } => {
-                        let offset = heap.len();
-                        env.extend(next_env.into_iter().map(|(id, addr)| (id, offset + addr)));
-                        heap.extend(next_heap.into_iter().map(|(addr, v)| (addr + offset, v)));
-                        Interpreter::Valid { result: b, env, heap }
-                    },
-                    Interpreter::Err { msg } => Interpreter::Err { msg },
-                }
-            },
-            Interpreter::Err { msg } => Interpreter::Err { msg },
-        }
-    }
-
-    fn fast_alloc(&self, v: Value) -> Interpreter<usize> {
-        match (*self).clone() {
-            Interpreter::Valid { result, env, mut heap } => {
-                let addr = heap.len();
-                heap.insert(addr, v);
-                Interpreter::Valid { result: addr, env, heap }
-            },
-            Interpreter::Err { msg } => Interpreter::Err { msg },
-        }
-    }
-
-    fn env(&self) -> Interpreter<BTreeMap<Identifier, usize>> {
-        match (*self).clone() {
-            Interpreter::Valid { result, env, heap } => Interpreter::Valid { result: env.clone(), env, heap },
-            Interpreter::Err { msg } => Interpreter::Err { msg },
-        }
-    }
-
-    fn heap(&self) -> Interpreter<BTreeMap<usize, Value>> {
-        match (*self).clone() {
-            Interpreter::Valid { result, env, heap } => Interpreter::Valid { result: heap.clone(), env, heap },
-            Interpreter::Err { msg } => Interpreter::Err { msg },
-        }
-    }
-
-    fn lookup(&self, id: &Identifier) -> Interpreter<usize> {
-        match (*self).clone() {
-            Interpreter::Valid { result: addr, env, heap } => {
-                match env.get(id) {
-                    Some(&addr) => Interpreter::Valid { result: addr, env, heap },
-                    None => I::crash(format!("undefined identifier {}", id.0)),
-                }
-            },
-            Interpreter::Err { msg } => Interpreter::Err { msg },
-        }
-    }
-}
-
-impl Default for Interpreter<()> {
-    fn default() -> Self {
-        Interpreter::Valid {
-            result: (),
-            env: BTreeMap::new(),
-            heap: BTreeMap::new(),
-        }
-    }
-}
-
+type Interpreter<'a, A> = ErrorState<'a, String, InterpreterState, A>;
 use Interpreter as I;
 
-impl<A> Interpreter<A> where A: Clone {
+impl<'a> Interpreter<'a, usize> {
+    fn alloc(v: Value) -> Interpreter<'a, usize> {
+        // Interpreter::Valid { result: 0, env: BTreeMap::new(), heap: BTreeMap::new() }.fast_alloc(v)
+        todo!()
+    }
+
+    fn lookup(id: &'a Identifier) -> Interpreter<'a, usize> {
+        // match (*self).clone() {
+        //     Interpreter::Valid { result: addr, env, heap } => {
+        //         match env.get(id) {
+        //             Some(&addr) => Interpreter::Valid { result: addr, env, heap },
+        //             None => I::crash(format!("undefined identifier {}", id.0)),
+        //         }
+        //     },
+        //     Interpreter::Err { msg } => Interpreter::Err { msg },
+        // }
+        todo!()
+    }
+}
+
+impl<'a> Interpreter<'a, ()> {
+    fn set_env(env: BTreeMap<Identifier, usize>) -> Interpreter<'a, ()> {
+        // Interpreter::Valid { result: (), env, heap: BTreeMap::new() }
+        todo!()
+    }
+
+    fn set_heap(heap: BTreeMap<usize, Value>) -> Interpreter<'a, ()> {
+        // Interpreter::Valid { result: (), env: BTreeMap::new(), heap }
+        todo!()
+    }
+}
+
+impl<'a> Interpreter<'a, BTreeMap<Identifier, usize>> {
+    fn env() -> Interpreter<'a, BTreeMap<Identifier, usize>> {
+        I::get().map(|s| s.env)
+    }
+}
+
+impl<'a> Interpreter<'a, BTreeMap<usize, Value>> {
+    fn heap() -> Interpreter<'a, BTreeMap<usize, Value>> {
+        I::get().map(|s| s.heap)
+    }
+}
+
+impl<'a, A> Interpreter<'a, A> where A: Clone {
+    fn ret(result: A) -> Interpreter<'a, A> {
+        // Interpreter::Valid {result, env: BTreeMap::new(), heap: BTreeMap::new()}
+        todo!()
+    }
+
+    fn fast_ret<B>(&self, result: B) -> Interpreter<'a, B> {
+        // match (*self).clone() {
+        //     Interpreter::Valid {result: _, env, heap} => Interpreter::Valid {result, env, heap},
+        //     Interpreter::Err {msg} => Interpreter::Err {msg},
+        // }
+        todo!()
+    }
+
+    fn crash(msg: String) -> Interpreter<'a, A> {
+        // Interpreter::Err { msg }
+        todo!()
+    }
+
+    fn fast_alloc(&self, v: Value) -> Interpreter<'a, usize> {
+        // match (*self).clone() {
+        //     Interpreter::Valid { result, env, mut heap } => {
+        //         let addr = heap.len();
+        //         heap.insert(addr, v);
+        //         Interpreter::Valid { result: addr, env, heap }
+        //     },
+        //     Interpreter::Err { msg } => Interpreter::Err { msg },
+        // }
+        todo!()
+    }
+}
+
+impl<'a> Default for Interpreter<'a, ()> {
+    fn default() -> Self { I::pure(()) }
+}
+
+impl<'a> Interpreter<'a, Value> {
+    fn top(
+        statements: &'a [AST]
+    ) -> Interpreter<'a, Value> {
+        statements.iter().fold(I::pure(Value::Null), move |interpreter, statement| {
+            interpreter.flat_map(move |_| I::eval(statement))
+        })
+    }
+
+    fn block(
+        statements: &'a [AST]
+    ) -> Interpreter<'a, Value> {
+        I::top(statements)
+    }
+
+    fn eval(
+        ast: &'a AST
+    ) -> Interpreter<'a, Value> {
+        // match ast {
+        //     AST::Null =>
+        //         self.null(),
+        //     AST::Integer(n) =>
+        //         self.integer(*n),
+        //     AST::Boolean(b) =>
+        //         self.boolean(*b),
+        //     AST::Variable { name, value } =>
+        //         self.variable(name, &**value).map(|()| Value::Null),
+        //     AST::Array { size, value } =>
+        //         self.array(&**size, &**value),
+        //     AST::Object { extends, members } =>
+        //         self.object(&**extends, members),
+        //     AST::AccessVariable { name } =>
+        //         self.access_variable(name),
+        //     AST::AccessField { object, field } =>
+        //         self.access_field(&**object, field),
+        //     AST::AccessArray { array, index } =>
+        //         self.access_array(&**array, &**index),
+        //     AST::AssignVariable { name, value } =>
+        //         self.assign_variable(name, &**value).map(|()| Value::Null),
+        //     AST::AssignField { object, field, value } =>
+        //         self.assign_field(&**object, field, &**value),
+        //     AST::AssignArray { array, index, value } =>
+        //         self.assign_array(&**array, &**index, &**value),
+        //     AST::Function { name, parameters, body } =>
+        //         self.function(name, parameters, &**body).map(|()| Value::Null),
+        //     AST::CallFunction { name, arguments } =>
+        //         self.call_function(name, arguments),
+        //     AST::CallMethod { object, name, arguments } =>
+        //         self.call_method(&**object, name, arguments),
+        //     AST::Top(stmts) =>
+        //         I::top(stmts),
+        //     AST::Block(stmts) =>
+        //         I::block(stmts),
+        //     AST::Loop { condition, body } =>
+        //         self.loop_de_loop(&**condition, &**body),
+        //     AST::Conditional { condition, consequent, alternative } =>
+        //         self.conditional(&**condition, &**consequent, &**alternative),
+        //     AST::Print { format, arguments } =>
+        //         self.print(format, arguments),
+        // }
+        todo!()
+    }
+}
+
+impl<'a, A> Interpreter<'a, A> where A: 'a, A: Clone {
     fn integer(
-        &self, i: i32
-    ) -> Interpreter<Value> {
+        &'a self, i: i32
+    ) -> Interpreter<'a, Value> {
         self.fast_ret(Value::Int(i))
     }
 
     fn boolean(
-        &self, b: bool
-    ) -> Interpreter<Value> {
+        &'a self, b: bool
+    ) -> Interpreter<'a, Value> {
         self.fast_ret(Value::Bool(b))
     }
 
     fn null(
-        &self
-    ) -> Interpreter<Value> {
+        &'a self
+    ) -> Interpreter<'a, Value> {
         self.fast_ret(Value::Null)
     }
 
     fn variable(
-        &self, name: &Identifier, value: &AST
-    ) -> Interpreter<()> {
-        self.eval(value).flat_map(|v| {
-            I::alloc(v).flat_map(|addr| {
-                self.env().flat_map(|mut env| {
+        &'a self, name: &'a Identifier, value: &'a AST
+    ) -> Interpreter<'a, ()> {
+        I::eval(value).flat_map(move |v| {
+            I::alloc(v).flat_map(move |addr| {
+                I::env().flat_map(move |mut env| {
                     env.insert(name.clone(), addr);
                     I::set_env(env)
                 })
@@ -185,78 +274,83 @@ impl<A> Interpreter<A> where A: Clone {
     }
 
     fn array(
-        &self, size: &AST, value: &AST
-    ) -> Interpreter<Value> {
+        &'a self, size: &'a AST, value: &'a AST
+    ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn object(
-        &self, extends: &AST, members: &[AST]
-    ) -> Interpreter<Value> {
+        &'a self, extends: &'a AST, members: &[AST]
+    ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn access_variable(
-        &self, name: &Identifier
-    ) -> Interpreter<Value> {
-        let int = self.env().flat_map(|env| {
+        &'a self, name: &Identifier
+    ) -> Interpreter<'a, Value> {
+        let int = I::env().flat_map(|env| {
             match env.get(name) {
                 Some(&addr) => I::ret(addr),
                 None => I::crash(format!("variable {} not found", name.0)),
             }
         });
         // FIXME: eugh
-        int.clone().flat_map(|addr| {
-            int.heap().map(|heap| {
-                heap[&addr].clone()
-            })
-        })
+        // int.clone().flat_map(|addr| {
+        //     int.heap().map(|heap| {
+        //         heap[&addr].clone()
+        //     })
+        // })
+        todo!()
     }
 
     fn access_field(
-        &self, object: &AST, field: &Identifier
-    ) -> Interpreter<Value> {
+        &'a self, object: &'a AST, field: &Identifier
+    ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn access_array(
-        &self, array: &AST, index: &AST
-    ) -> Interpreter<Value> {
+        &'a self, array: &'a AST, index: &'a AST
+    ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn assign_variable(
-        &self, name: &Identifier, value: &AST
-    ) -> Interpreter<()> {
-        let int = self.eval(&value).flat_map(|v| {
-            self.lookup(name).map(|addr| (addr, v))
-        });
-        int.clone().flat_map(|(addr, v)| {
-            int.heap().flat_map(|mut heap| {
-                heap.insert(addr, v);
-                I::set_heap(heap)
+        &'a self, name: &'a Identifier, value: &'a AST
+    ) -> Interpreter<'a, ()> {
+        I::eval(&value).flat_map(move |v| {
+            I::lookup(name).flat_map(move |addr| {
+                // FIXME weird borrowck (likely lifetime inference) issues,
+                // claiming that v is stuck captured in a Fn closure (despite
+                // all the moves)
+                let v = v.clone();
+                I::heap().flat_map(move |mut heap| {
+                    heap.insert(addr, v.clone());
+                    I::set_heap(heap)
+                })
             })
         })
     }
 
     fn assign_field(
-        &self, object: &AST, field: &Identifier, value: &AST
-    ) -> Interpreter<Value> {
+        &'a self, object: &'a AST, field: &Identifier, value: &'a AST
+    ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn assign_array(
-        &self, array: &AST, index: &AST, value: &AST
-    ) -> Interpreter<Value> {
+        &'a self, array: &'a AST, index: &'a AST, value: &'a AST
+    ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn function(
-        &self, name: &Identifier, parameters: &[Identifier], body: &AST
-    ) -> Interpreter<()> {
-        self.fast_alloc(Value::Function { parameters: parameters.to_vec(), body: Box::new(body.clone()) })
+        &'a self, name: &'a Identifier, parameters: &'a [Identifier], body: &'a AST
+    ) -> Interpreter<'a, ()> {
+        // Value::Function { parameters: parameters.to_vec(), body: Box::new(body.clone()) }
+        self.fast_alloc(todo!())
             .flat_map(|addr| {
-                self.env().flat_map(|mut env| {
+                I::env().flat_map(move |mut env| {
                     env.insert(name.clone(), addr);
                     I::set_env(env)
                 })
@@ -264,28 +358,31 @@ impl<A> Interpreter<A> where A: Clone {
     }
 
     fn call_function(
-        &self, name: &Identifier, arguments: &[AST]
-    ) -> Interpreter<Value> {
-        self.lookup(name).flat_map(move |addr| {
-            self.heap().flat_map(|heap| {
+        &'a self, name: &'a Identifier, arguments: &'a [AST]
+    ) -> Interpreter<'a, Value> {
+        I::lookup(name).flat_map(move |addr| {
+            I::heap().flat_map(move |heap| {
                 match heap.get(&addr) {
                     None => I::crash(format!("function {} not found", name.0)),
                     Some(Value::Function { parameters, body }) => {
-                        let mut interpreter = self.fast_ret(());
+                        let mut interpreter = I::pure(());
                         for (parameter, argument) in parameters.into_iter().zip(arguments.into_iter()) {
-                            interpreter = interpreter.eval(&argument).flat_map(|v| {
-                                interpreter.fast_alloc(v).flat_map(|addr| {
-                                    interpreter.env().flat_map(|mut env| {
-                                        env.insert(parameter.clone(), addr);
-                                        I::set_env(env)
-                                    })
-                                })
-                            });
+                            // interpreter = interpreter.eval(&argument).flat_map(move |v| {
+                            //     let p = parameter.clone();
+                            //     interpreter.fast_alloc(v).flat_map(move |addr| {
+                            //         I::env().flat_map(move |mut env| {
+                            //             env.insert(p, addr);
+                            //             I::set_env(env)
+                            //         })
+                            //     })
+                            // });
+                            todo!()
                         }
 
-                        interpreter.clone().flat_map(|()| {
-                            interpreter.eval(&**body)
-                        })
+                        // interpreter.clone().flat_map(|()| {
+                        //     interpreter.eval(&**body)
+                        // })
+                        todo!()
                     },
                     Some(v) => I::crash(format!("cannot call {} = {}", name.0, v)),
                 }
@@ -294,33 +391,17 @@ impl<A> Interpreter<A> where A: Clone {
     }
 
     fn call_method(
-        &self, object: &AST, name: &Identifier, arguments: &[AST]
-    ) -> Interpreter<Value> {
+        &'a self, object: &'a AST, name: &Identifier, arguments: &[AST]
+    ) -> Interpreter<'a, Value> {
         todo!()
     }
 
-    fn top(
-        &self, statements: &[AST]
-    ) -> Interpreter<Value> {
-        let mut interpreter = self.fast_ret(Value::Null);
-        for statement in statements {
-            interpreter = interpreter.eval(statement);
-        }
-        interpreter
-    }
-
-    fn block(
-        &self, statements: &[AST]
-    ) -> Interpreter<Value> {
-        self.top(statements)
-    }
-
     fn loop_de_loop(
-        &self, condition: &AST, body: &AST
-    ) -> Interpreter<Value> {
-        self.eval(condition).flat_map(|v| {
+        &'a self, condition: &'a AST, body: &'a AST
+    ) -> Interpreter<'a, Value> {
+        I::eval(condition).flat_map(|v| {
             match v {
-                Value::Bool(true) => self.eval(body).flat_map(|v| {
+                Value::Bool(true) => I::eval(body).flat_map(|v| {
                     self.loop_de_loop(condition, body)
                 }),
                 Value::Bool(false) => self.fast_ret(Value::Null),
@@ -330,30 +411,32 @@ impl<A> Interpreter<A> where A: Clone {
     }
 
     fn conditional(
-        &self, condition: &AST, consequent: &AST, alternative: &AST
-    ) -> Interpreter<Value> {
-        self.eval(condition).flat_map(|v| {
+        &'a self, condition: &'a AST, consequent: &'a AST, alternative: &'a AST
+    ) -> Interpreter<'a, Value> {
+        I::eval(condition).flat_map(|v| {
             match v {
-                Value::Bool(true) => self.eval(consequent),
-                Value::Bool(false) => self.eval(alternative),
+                Value::Bool(true) => I::eval(consequent),
+                Value::Bool(false) => I::eval(alternative),
                 _ => I::crash(format!("condition must be a boolean: {}", v)),
             }
         })
     }
 
     fn print(
-        &self, format: &str, arguments: &[AST]
-    ) -> Interpreter<Value> {
+        &'a self, format: &'a str, arguments: &'a [AST]
+    ) -> Interpreter<'a, Value> {
         let mut interpreter = self.fast_ret(vec![]);
         for argument in arguments {
-            interpreter = interpreter.clone().flat_map(|mut args|
-                interpreter.eval(argument).map(|v| {
-                    args.push(v);
-                    args
-                })
-            );
+            // interpreter = interpreter.clone().flat_map(|mut args|
+            //     interpreter.eval(argument).map(|v| {
+            //         args.push(v);
+            //         args
+            //     })
+            // );
+            todo!()
         }
-        interpreter.flat_map(|args| {
+
+        interpreter.flat_map(|args: Vec<Value>| {
             let mut escape = false;
             let mut str = String::new();
             let mut err = None;
@@ -394,53 +477,6 @@ impl<A> Interpreter<A> where A: Clone {
             }
         })
     }
-
-    fn eval(
-        &self, ast: &AST
-    ) -> Interpreter<Value> {
-        match ast {
-            AST::Null =>
-                self.null(),
-            AST::Integer(n) =>
-                self.integer(*n),
-            AST::Boolean(b) =>
-                self.boolean(*b),
-            AST::Variable { name, value } =>
-                self.variable(name, &**value).map(|()| Value::Null),
-            AST::Array { size, value } =>
-                self.array(&**size, &**value),
-            AST::Object { extends, members } =>
-                self.object(&**extends, members),
-            AST::AccessVariable { name } =>
-                self.access_variable(name),
-            AST::AccessField { object, field } =>
-                self.access_field(&**object, field),
-            AST::AccessArray { array, index } =>
-                self.access_array(&**array, &**index),
-            AST::AssignVariable { name, value } =>
-                self.assign_variable(name, &**value).map(|()| Value::Null),
-            AST::AssignField { object, field, value } =>
-                self.assign_field(&**object, field, &**value),
-            AST::AssignArray { array, index, value } =>
-                self.assign_array(&**array, &**index, &**value),
-            AST::Function { name, parameters, body } =>
-                self.function(name, parameters, &**body).map(|()| Value::Null),
-            AST::CallFunction { name, arguments } =>
-                self.call_function(name, arguments),
-            AST::CallMethod { object, name, arguments } =>
-                self.call_method(&**object, name, arguments),
-            AST::Top(stmts) =>
-                self.top(stmts),
-            AST::Block(stmts) =>
-                self.block(stmts),
-            AST::Loop { condition, body } =>
-                self.loop_de_loop(&**condition, &**body),
-            AST::Conditional { condition, consequent, alternative } =>
-                self.conditional(&**condition, &**consequent, &**alternative),
-            AST::Print { format, arguments } =>
-                self.print(format, arguments),
-        }
-    }
 }
 
 fn main() -> Result<()> {
@@ -448,7 +484,6 @@ fn main() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let ast: AST = serde_json::from_str(&input)?;
-    let interpreter: Interpreter<()> = Default::default();
-    interpreter.eval(&ast);
+    (I::eval(&ast).run_error_state)(InterpreterState::default());
     Ok(())
 }
