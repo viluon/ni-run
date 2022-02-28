@@ -2,6 +2,7 @@
 
 use std::{io::Read, collections::BTreeMap, fmt::Display, rc::Rc};
 use anyhow::Result;
+use anyhow::anyhow;
 
 use fml_ast_interpreter::*;
 use state::*;
@@ -14,8 +15,8 @@ pub struct ErrorState<'a, E, S, A> {
 }
 
 impl<'a, E, S, A> ErrorState<'a, E, S, A> where E: 'a, S: 'a, A: 'a {
-    pub fn flat_map<B, F>(self, f: F) -> ErrorState<'a, E, S, B>
-    where F: Fn(A) -> ErrorState<'a, E, S, B> + 'a {
+    pub fn flat_map<'b, B, F>(&'b self, f: F) -> ErrorState<'b, E, S, B>
+    where F: FnOnce(A) -> ErrorState<'b, E, S, B> + 'b {
         ErrorState {
             run_error_state: Box::new(move |first_state| {
                 match self.run_error_state.call_once((first_state,)) {
@@ -27,7 +28,7 @@ impl<'a, E, S, A> ErrorState<'a, E, S, A> where E: 'a, S: 'a, A: 'a {
     }
 
     pub fn map<B, F>(self, f: F) -> ErrorState<'a, E, S, B>
-    where F: Fn(A) -> B + 'a, B: 'a {
+    where F: FnOnce(A) -> B + 'a, B: 'a {
         self.flat_map(move |a| ErrorState::pure(f(a)))
     }
 
@@ -99,33 +100,38 @@ use Interpreter as I;
 
 impl<'a> Interpreter<'a, usize> {
     fn alloc(v: Value) -> Interpreter<'a, usize> {
-        // Interpreter::Valid { result: 0, env: BTreeMap::new(), heap: BTreeMap::new() }.fast_alloc(v)
-        todo!()
+        I::heap().flat_map(move |mut heap| {
+            let id = heap.len();
+            heap.insert(id, v.clone());
+            I::set_heap(heap).map(move |_| id)
+        })
     }
 
     fn lookup(id: &'a Identifier) -> Interpreter<'a, usize> {
-        // match (*self).clone() {
-        //     Interpreter::Valid { result: addr, env, heap } => {
-        //         match env.get(id) {
-        //             Some(&addr) => Interpreter::Valid { result: addr, env, heap },
-        //             None => I::crash(format!("undefined identifier {}", id.0)),
-        //         }
-        //     },
-        //     Interpreter::Err { msg } => Interpreter::Err { msg },
-        // }
-        todo!()
+        I::env().flat_map(move |env| {
+            match env.get(id) {
+                Some(&addr) => I::pure(addr),
+                None => I::error(format!("undefined variable: {}", id.0))
+            }
+        })
     }
 }
 
 impl<'a> Interpreter<'a, ()> {
+    // FIXME unnecessary cloning because borrowck is dumb
     fn set_env(env: BTreeMap<Identifier, usize>) -> Interpreter<'a, ()> {
-        // Interpreter::Valid { result: (), env, heap: BTreeMap::new() }
-        todo!()
+        I::get().flat_map(move |s| I::put(InterpreterState { env: env.clone(), ..s }))
     }
 
     fn set_heap(heap: BTreeMap<usize, Value>) -> Interpreter<'a, ()> {
-        // Interpreter::Valid { result: (), env: BTreeMap::new(), heap }
-        todo!()
+        I::get().flat_map(move |s| I::put(InterpreterState { heap: heap.clone(), ..s }))
+    }
+
+    fn bind(id: Identifier, addr: usize) -> Interpreter<'a, ()> {
+        I::env().flat_map(move |mut env| {
+            env.insert(id.clone(), addr);
+            I::set_env(env)
+        })
     }
 }
 
@@ -138,38 +144,6 @@ impl<'a> Interpreter<'a, BTreeMap<Identifier, usize>> {
 impl<'a> Interpreter<'a, BTreeMap<usize, Value>> {
     fn heap() -> Interpreter<'a, BTreeMap<usize, Value>> {
         I::get().map(|s| s.heap)
-    }
-}
-
-impl<'a, A> Interpreter<'a, A> where A: Clone {
-    fn ret(result: A) -> Interpreter<'a, A> {
-        // Interpreter::Valid {result, env: BTreeMap::new(), heap: BTreeMap::new()}
-        todo!()
-    }
-
-    fn fast_ret<B>(&self, result: B) -> Interpreter<'a, B> {
-        // match (*self).clone() {
-        //     Interpreter::Valid {result: _, env, heap} => Interpreter::Valid {result, env, heap},
-        //     Interpreter::Err {msg} => Interpreter::Err {msg},
-        // }
-        todo!()
-    }
-
-    fn crash(msg: String) -> Interpreter<'a, A> {
-        // Interpreter::Err { msg }
-        todo!()
-    }
-
-    fn fast_alloc(&self, v: Value) -> Interpreter<'a, usize> {
-        // match (*self).clone() {
-        //     Interpreter::Valid { result, env, mut heap } => {
-        //         let addr = heap.len();
-        //         heap.insert(addr, v);
-        //         Interpreter::Valid { result: addr, env, heap }
-        //     },
-        //     Interpreter::Err { msg } => Interpreter::Err { msg },
-        // }
-        todo!()
     }
 }
 
@@ -286,8 +260,8 @@ impl<'a> Interpreter<'a, Value> {
     ) -> Interpreter<'a, Value> {
         let int = I::env().flat_map(|env| {
             match env.get(name) {
-                Some(&addr) => I::ret(addr),
-                None => I::crash(format!("variable {} not found", name.0)),
+                Some(&addr) => I::pure(addr),
+                None => I::error(format!("variable {} not found", name.0)),
             }
         });
         // FIXME: eugh
@@ -343,45 +317,43 @@ impl<'a> Interpreter<'a, Value> {
     fn function(
         name: &'a Identifier, parameters: &'a [Identifier], body: &'a AST
     ) -> Interpreter<'a, ()> {
-        // Value::Function { parameters: parameters.to_vec(), body: Box::new(body.clone()) }
-        // self.fast_alloc(todo!())
-        //     .flat_map(|addr| {
-        //         I::env().flat_map(move |mut env| {
-        //             env.insert(name.clone(), addr);
-        //             I::set_env(env)
-        //         })
-        //     })
-        todo!()
+        let f = Value::Function { parameters: parameters.to_vec(), body: Box::new(body.clone()) };
+        I::alloc(f).flat_map(move |addr| {
+            I::env().flat_map(move |mut env| {
+                env.insert(name.clone(), addr);
+                I::set_env(env)
+            })
+        })
     }
 
-    fn call_function(
+    fn call_function<'b>(
         name: &'a Identifier, arguments: &'a [AST]
-    ) -> Interpreter<'a, Value> {
+    ) -> Interpreter<'b, Value> {
+        let perform_call = move |parameters: &'a Vec<Identifier>, body: &Box<AST>| -> Interpreter<'b, Value> {
+            parameters.iter().zip(arguments.iter().map(Box::new))
+                .fold(I::pure(body.clone()), move |interpreter, (param, arg)| {
+                    let param = param.clone();
+                    let arg = arg.clone();
+                    interpreter.flat_map(move |body| {
+                        I::eval(&*arg).flat_map(move |v| {
+                            I::alloc(v).flat_map(move |addr| {
+                                I::bind(param.clone(), addr).map(move |()| body)
+                            })
+                        })
+                    })
+                }).flat_map(move |body| {
+                    I::eval(&*body)
+                })
+        };
+
         I::lookup(name).flat_map(move |addr| {
             I::heap().flat_map(move |heap| {
                 match heap.get(&addr) {
-                    None => I::crash(format!("function {} not found", name.0)),
+                    None => I::error(format!("function {} not found", name.0)),
                     Some(Value::Function { parameters, body }) => {
-                        let mut interpreter = I::pure(());
-                        for (parameter, argument) in parameters.into_iter().zip(arguments.into_iter()) {
-                            // interpreter = interpreter.eval(&argument).flat_map(move |v| {
-                            //     let p = parameter.clone();
-                            //     interpreter.fast_alloc(v).flat_map(move |addr| {
-                            //         I::env().flat_map(move |mut env| {
-                            //             env.insert(p, addr);
-                            //             I::set_env(env)
-                            //         })
-                            //     })
-                            // });
-                            todo!()
-                        }
-
-                        // interpreter.clone().flat_map(|()| {
-                        //     interpreter.eval(&**body)
-                        // })
-                        todo!()
+                        perform_call(parameters, body)
                     },
-                    Some(v) => I::crash(format!("cannot call {} = {}", name.0, v)),
+                    Some(v) => I::error(format!("cannot call {} (bound to {}), it is not a function", v, name.0)),
                 }
             })
         })
@@ -402,7 +374,7 @@ impl<'a> Interpreter<'a, Value> {
                     I::loop_de_loop(condition, body)
                 }),
                 Value::Bool(false) => I::pure(Value::Null),
-                _ => I::crash(format!("condition must be a boolean: {}", v)),
+                _ => I::error(format!("condition must be a boolean: {}", v)),
             }
         })
     }
@@ -414,7 +386,7 @@ impl<'a> Interpreter<'a, Value> {
             match v {
                 Value::Bool(true) => I::eval(consequent),
                 Value::Bool(false) => I::eval(alternative),
-                _ => I::crash(format!("condition must be a boolean: {}", v)),
+                _ => I::error(format!("condition must be a boolean: {}", v)),
             }
         })
     }
@@ -465,8 +437,8 @@ impl<'a> Interpreter<'a, Value> {
             }
 
             match err {
-                Some(err) => I::crash(err),
-                None if escape => I::crash("invalid escape sequence: \\".to_string()),
+                Some(err) => I::error(err),
+                None if escape => I::error("invalid escape sequence: \\".to_string()),
                 None => {
                     println!("{}", str);
                     I::pure(Value::Null)
@@ -480,7 +452,10 @@ fn main() -> Result<()> {
     // load json from stdin
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
-    let ast: AST = serde_json::from_str(&input)?;
-    (I::eval(&ast).run_error_state)(InterpreterState::default());
-    Ok(())
+    let ast = serde_json::from_str(&input)?;
+    let result = (I::eval(&ast).run_error_state)(InterpreterState::default());
+    match result {
+        Either::Left(msg) => Err(anyhow!(msg)),
+        Either::Right((v, _s)) => Ok(println!("finished with: {}", v)),
+    }
 }

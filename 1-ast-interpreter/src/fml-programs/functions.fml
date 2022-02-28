@@ -1,0 +1,4 @@
+function id(x) -> x;
+function three() -> 3;
+
+print("result: ~", id(id(three())))
