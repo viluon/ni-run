@@ -1,4 +1,12 @@
 function id(x) -> x;
 function three() -> 3;
 
-print("result: ~", id(id(three())))
+print("result: ~", id(id(three())));
+
+function foo(x) -> begin
+    let y = 5;
+    if x then id(foo(false))
+    else three()
+end;
+
+print("and\n\twhat about\n\t\t~ <- this\n\tor that -> ~", foo(true), foo(false))

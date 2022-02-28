@@ -45,6 +45,13 @@ struct Interpreter {
 use Interpreter as I;
 
 impl Interpreter {
+    fn new() -> Interpreter {
+        Interpreter {
+            env: BTreeMap::new(),
+            heap: BTreeMap::new(),
+        }
+    }
+
     fn alloc(&mut self, v: Value) -> Result<usize> {
         let addr = self.heap.len();
         self.heap.insert(addr, v);
@@ -71,7 +78,7 @@ impl Interpreter {
 
 impl Interpreter {
     fn top(&mut self, statements: &[AST]) -> Result<Value> {
-        todo!()
+        statements.iter().fold(Ok(Value::Null), |_, s| self.eval(s))
     }
 
     fn block(&mut self, statements: &[AST]) -> Result<Value> {
@@ -237,6 +244,10 @@ impl Interpreter {
         let mut err = None;
         let mut arg_index = 0;
 
+        let escapes = BTreeMap::from_iter(vec![
+            ('~', '~'), ('n', '\n'), ('"', '"'), ('r', '\r'), ('t', '\t'), ('\\', '\\')
+        ]);
+
         for ch in format.chars() {
             match (escape, ch) {
                 (false, '~') => match args.get(arg_index) {
@@ -251,8 +262,8 @@ impl Interpreter {
                 },
                 (false, '\\') => escape = true,
                 (false, ch) => str.push(ch),
-                (true, '~' | 'n' | '"' | 'r' | 't' | '\\') => {
-                    str.push(ch);
+                (true, ch) if escapes.contains_key(&ch) => {
+                    str.push(escapes[&ch]);
                     escape = false
                 },
                 (true, _) => {
@@ -278,6 +289,6 @@ fn main() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let ast = serde_json::from_str(&input)?;
-    Interpreter::new().eval(ast)?;
+    Interpreter::new().eval(&ast)?;
     Ok(())
 }
