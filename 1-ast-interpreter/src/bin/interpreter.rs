@@ -195,73 +195,69 @@ impl<'a> Interpreter<'a, Value> {
     fn eval(
         ast: &'a AST
     ) -> Interpreter<'a, Value> {
-        // match ast {
-        //     AST::Null =>
-        //         self.null(),
-        //     AST::Integer(n) =>
-        //         self.integer(*n),
-        //     AST::Boolean(b) =>
-        //         self.boolean(*b),
-        //     AST::Variable { name, value } =>
-        //         self.variable(name, &**value).map(|()| Value::Null),
-        //     AST::Array { size, value } =>
-        //         self.array(&**size, &**value),
-        //     AST::Object { extends, members } =>
-        //         self.object(&**extends, members),
-        //     AST::AccessVariable { name } =>
-        //         self.access_variable(name),
-        //     AST::AccessField { object, field } =>
-        //         self.access_field(&**object, field),
-        //     AST::AccessArray { array, index } =>
-        //         self.access_array(&**array, &**index),
-        //     AST::AssignVariable { name, value } =>
-        //         self.assign_variable(name, &**value).map(|()| Value::Null),
-        //     AST::AssignField { object, field, value } =>
-        //         self.assign_field(&**object, field, &**value),
-        //     AST::AssignArray { array, index, value } =>
-        //         self.assign_array(&**array, &**index, &**value),
-        //     AST::Function { name, parameters, body } =>
-        //         self.function(name, parameters, &**body).map(|()| Value::Null),
-        //     AST::CallFunction { name, arguments } =>
-        //         self.call_function(name, arguments),
-        //     AST::CallMethod { object, name, arguments } =>
-        //         self.call_method(&**object, name, arguments),
-        //     AST::Top(stmts) =>
-        //         I::top(stmts),
-        //     AST::Block(stmts) =>
-        //         I::block(stmts),
-        //     AST::Loop { condition, body } =>
-        //         self.loop_de_loop(&**condition, &**body),
-        //     AST::Conditional { condition, consequent, alternative } =>
-        //         self.conditional(&**condition, &**consequent, &**alternative),
-        //     AST::Print { format, arguments } =>
-        //         self.print(format, arguments),
-        // }
-        todo!()
+        match ast {
+            AST::Null =>
+                I::null(),
+            AST::Integer(n) =>
+                I::integer(*n),
+            AST::Boolean(b) =>
+                I::boolean(*b),
+            AST::Variable { name, value } =>
+                I::variable(name, &**value).map(|()| Value::Null),
+            AST::Array { size, value } =>
+                I::array(&**size, &**value),
+            AST::Object { extends, members } =>
+                I::object(&**extends, members),
+            AST::AccessVariable { name } =>
+                I::access_variable(name),
+            AST::AccessField { object, field } =>
+                I::access_field(&**object, field),
+            AST::AccessArray { array, index } =>
+                I::access_array(&**array, &**index),
+            AST::AssignVariable { name, value } =>
+                I::assign_variable(name, &**value).map(|()| Value::Null),
+            AST::AssignField { object, field, value } =>
+                I::assign_field(&**object, field, &**value),
+            AST::AssignArray { array, index, value } =>
+                I::assign_array(&**array, &**index, &**value),
+            AST::Function { name, parameters, body } =>
+                I::function(name, parameters, &**body).map(|()| Value::Null),
+            AST::CallFunction { name, arguments } =>
+                I::call_function(name, arguments),
+            AST::CallMethod { object, name, arguments } =>
+                I::call_method(&**object, name, arguments),
+            AST::Top(stmts) =>
+                I::top(stmts),
+            AST::Block(stmts) =>
+                I::block(stmts),
+            AST::Loop { condition, body } =>
+                I::loop_de_loop(&**condition, &**body),
+            AST::Conditional { condition, consequent, alternative } =>
+                I::conditional(&**condition, &**consequent, &**alternative),
+            AST::Print { format, arguments } =>
+                I::print(format, arguments),
+        }
     }
-}
 
-impl<'a, A> Interpreter<'a, A> where A: 'a, A: Clone {
     fn integer(
-        &'a self, i: i32
+        i: i32
     ) -> Interpreter<'a, Value> {
-        self.fast_ret(Value::Int(i))
+        I::pure(Value::Int(i))
     }
 
     fn boolean(
-        &'a self, b: bool
+        b: bool
     ) -> Interpreter<'a, Value> {
-        self.fast_ret(Value::Bool(b))
+        I::pure(Value::Bool(b))
     }
 
     fn null(
-        &'a self
     ) -> Interpreter<'a, Value> {
-        self.fast_ret(Value::Null)
+        I::pure(Value::Null)
     }
 
     fn variable(
-        &'a self, name: &'a Identifier, value: &'a AST
+        name: &'a Identifier, value: &'a AST
     ) -> Interpreter<'a, ()> {
         I::eval(value).flat_map(move |v| {
             I::alloc(v).flat_map(move |addr| {
@@ -274,19 +270,19 @@ impl<'a, A> Interpreter<'a, A> where A: 'a, A: Clone {
     }
 
     fn array(
-        &'a self, size: &'a AST, value: &'a AST
+        size: &'a AST, value: &'a AST
     ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn object(
-        &'a self, extends: &'a AST, members: &[AST]
+        extends: &'a AST, members: &[AST]
     ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn access_variable(
-        &'a self, name: &Identifier
+        name: &Identifier
     ) -> Interpreter<'a, Value> {
         let int = I::env().flat_map(|env| {
             match env.get(name) {
@@ -304,19 +300,19 @@ impl<'a, A> Interpreter<'a, A> where A: 'a, A: Clone {
     }
 
     fn access_field(
-        &'a self, object: &'a AST, field: &Identifier
+        object: &'a AST, field: &Identifier
     ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn access_array(
-        &'a self, array: &'a AST, index: &'a AST
+        array: &'a AST, index: &'a AST
     ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn assign_variable(
-        &'a self, name: &'a Identifier, value: &'a AST
+        name: &'a Identifier, value: &'a AST
     ) -> Interpreter<'a, ()> {
         I::eval(&value).flat_map(move |v| {
             I::lookup(name).flat_map(move |addr| {
@@ -333,32 +329,33 @@ impl<'a, A> Interpreter<'a, A> where A: 'a, A: Clone {
     }
 
     fn assign_field(
-        &'a self, object: &'a AST, field: &Identifier, value: &'a AST
+        object: &'a AST, field: &Identifier, value: &'a AST
     ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn assign_array(
-        &'a self, array: &'a AST, index: &'a AST, value: &'a AST
+        array: &'a AST, index: &'a AST, value: &'a AST
     ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn function(
-        &'a self, name: &'a Identifier, parameters: &'a [Identifier], body: &'a AST
+        name: &'a Identifier, parameters: &'a [Identifier], body: &'a AST
     ) -> Interpreter<'a, ()> {
         // Value::Function { parameters: parameters.to_vec(), body: Box::new(body.clone()) }
-        self.fast_alloc(todo!())
-            .flat_map(|addr| {
-                I::env().flat_map(move |mut env| {
-                    env.insert(name.clone(), addr);
-                    I::set_env(env)
-                })
-            })
+        // self.fast_alloc(todo!())
+        //     .flat_map(|addr| {
+        //         I::env().flat_map(move |mut env| {
+        //             env.insert(name.clone(), addr);
+        //             I::set_env(env)
+        //         })
+        //     })
+        todo!()
     }
 
     fn call_function(
-        &'a self, name: &'a Identifier, arguments: &'a [AST]
+        name: &'a Identifier, arguments: &'a [AST]
     ) -> Interpreter<'a, Value> {
         I::lookup(name).flat_map(move |addr| {
             I::heap().flat_map(move |heap| {
@@ -391,27 +388,27 @@ impl<'a, A> Interpreter<'a, A> where A: 'a, A: Clone {
     }
 
     fn call_method(
-        &'a self, object: &'a AST, name: &Identifier, arguments: &[AST]
+        object: &'a AST, name: &Identifier, arguments: &[AST]
     ) -> Interpreter<'a, Value> {
         todo!()
     }
 
     fn loop_de_loop(
-        &'a self, condition: &'a AST, body: &'a AST
+        condition: &'a AST, body: &'a AST
     ) -> Interpreter<'a, Value> {
         I::eval(condition).flat_map(|v| {
             match v {
                 Value::Bool(true) => I::eval(body).flat_map(|v| {
-                    self.loop_de_loop(condition, body)
+                    I::loop_de_loop(condition, body)
                 }),
-                Value::Bool(false) => self.fast_ret(Value::Null),
+                Value::Bool(false) => I::pure(Value::Null),
                 _ => I::crash(format!("condition must be a boolean: {}", v)),
             }
         })
     }
 
     fn conditional(
-        &'a self, condition: &'a AST, consequent: &'a AST, alternative: &'a AST
+        condition: &'a AST, consequent: &'a AST, alternative: &'a AST
     ) -> Interpreter<'a, Value> {
         I::eval(condition).flat_map(|v| {
             match v {
@@ -423,20 +420,20 @@ impl<'a, A> Interpreter<'a, A> where A: 'a, A: Clone {
     }
 
     fn print(
-        &'a self, format: &'a str, arguments: &'a [AST]
+        format: &'a str, arguments: &'a [AST]
     ) -> Interpreter<'a, Value> {
-        let mut interpreter = self.fast_ret(vec![]);
-        for argument in arguments {
-            // interpreter = interpreter.clone().flat_map(|mut args|
-            //     interpreter.eval(argument).map(|v| {
-            //         args.push(v);
-            //         args
-            //     })
-            // );
-            todo!()
-        }
+        let interpreter =
+            arguments.iter().fold(I::pure(vec![]), |interpreter, arg| {
+                interpreter.flat_map(move |args|
+                    I::eval(arg).map(move |v| {
+                        let mut args = args.clone();
+                        args.push(v);
+                        args
+                    })
+                )
+            });
 
-        interpreter.flat_map(|args: Vec<Value>| {
+        interpreter.flat_map(move |args| {
             let mut escape = false;
             let mut str = String::new();
             let mut err = None;
@@ -472,7 +469,7 @@ impl<'a, A> Interpreter<'a, A> where A: 'a, A: Clone {
                 None if escape => I::crash("invalid escape sequence: \\".to_string()),
                 None => {
                     println!("{}", str);
-                    self.fast_ret(Value::Null)
+                    I::pure(Value::Null)
                 },
             }
         })
