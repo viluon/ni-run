@@ -1,11 +1,10 @@
 #![feature(fn_traits, associated_type_defaults)]
 
-use std::{io::Read, collections::BTreeMap, fmt::Display, rc::Rc};
+use std::{io::Read, collections::BTreeMap, fmt::Display};
 use anyhow::Result;
 use anyhow::anyhow;
 
 use fml_ast_interpreter::*;
-use state::*;
 use ast::*;
 
 #[derive(Debug, Clone)]
@@ -14,6 +13,62 @@ enum Value {
     Bool(bool),
     Function { parameters: Vec<Identifier>, body: Box<AST> },
     Null,
+}
+
+impl From<Value> for Vec<u8> {
+    fn from(value: Value) -> Self {
+        let (tag, mut repr) = match value {
+            Value::Int(i) => (1, i.to_le_bytes().to_vec()),
+            Value::Bool(b) => (2, vec![if b { 1 } else { 0 }]),
+            Value::Function { parameters, body } => {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(parameters.len() as u64).to_le_bytes());
+                for param in parameters {
+                    bytes.extend_from_slice(&param.0.len().to_le_bytes());
+                    bytes.extend_from_slice(param.0.as_bytes());
+                }
+                let serialised = serde_json::to_vec(&*body).unwrap();
+                bytes.extend_from_slice((serialised.len() as u64).to_le_bytes().as_slice());
+                bytes.extend_from_slice(serialised.as_slice());
+                (3, bytes)
+            }
+            Value::Null => (4, vec![]),
+        };
+        repr.insert(0, tag);
+        repr
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(bytes: Vec<u8>) -> Self {
+        let tag = bytes[0];
+        let bytes = bytes.into_iter().skip(1).collect::<Vec<u8>>();
+        match tag {
+            1 => Value::Int(i32::from_le_bytes(bytes.as_slice()[..4].try_into().unwrap())),
+            2 => Value::Bool(bytes[0] == 1),
+            3 => {
+                let mut repr = bytes.as_slice();
+                let num_params = u64::from_le_bytes(repr[..8].try_into().unwrap());
+                repr = &repr[8..];
+                let mut parameters = Vec::new();
+                for _ in 0..num_params {
+                    let len = u64::from_le_bytes(repr[..8].try_into().unwrap());
+                    repr = &repr[8..];
+                    let param = String::from_utf8(repr[..len as usize].to_vec()).unwrap();
+                    parameters.push(Identifier(param));
+                    repr = &repr[len as usize..];
+                }
+                let num_body_bytes = u64::from_le_bytes(repr[..8].try_into().unwrap());
+                repr = &repr[8..];
+                let mut body_bytes = Vec::new();
+                body_bytes.extend_from_slice(&repr[..num_body_bytes as usize]);
+                let body = serde_json::from_slice(&body_bytes).unwrap();
+                Value::Function { parameters, body }
+            }
+            4 => Value::Null,
+            _ => panic!("Invalid value tag"),
+        }
+    }
 }
 
 impl Value {
@@ -39,7 +94,7 @@ impl Display for Value {
 #[derive(Debug, Default, Clone)]
 struct Interpreter {
     env: BTreeMap<Identifier, usize>,
-    heap: BTreeMap<usize, Value>,
+    heap: Vec<u8>,
 }
 
 use Interpreter as I;
@@ -48,19 +103,19 @@ impl Interpreter {
     fn new() -> Interpreter {
         Interpreter {
             env: BTreeMap::new(),
-            heap: BTreeMap::new(),
+            heap: vec![],
         }
     }
 
     fn alloc(&mut self, v: Value) -> Result<usize> {
         let addr = self.heap.len();
-        self.heap.insert(addr, v);
+        self.set(addr, v);
         Ok(addr)
     }
 
-    fn lookup(&mut self, id: &Identifier) -> Result<&Value> {
+    fn lookup(&mut self, id: &Identifier) -> Result<Value> {
         match self.env.get(id) {
-            Some(addr) => match self.heap.get(addr) {
+            Some(&addr) => match self.get(addr) {
                 Some(v) => Ok(v),
                 None => Err(anyhow!(
                     "interpreter bug: {} points to address {} (outside the heap). \
@@ -76,6 +131,21 @@ impl Interpreter {
 
     fn bind(&mut self, id: &Identifier, addr: usize) -> Result<()> {
         self.env.insert(id.clone(), addr);
+        Ok(())
+    }
+
+    fn get(&self, addr: usize) -> Option<Value> {
+        if addr < self.heap.len() {
+            Some(Value::from(self.heap[addr..].to_vec()))
+        } else { None }
+    }
+
+    fn set(&mut self, addr: usize, v: Value) -> Result<()> {
+        let repr: Vec<u8> = v.into();
+        if self.heap.len() < addr + repr.len() {
+            self.heap.resize(addr + repr.len(), 0);
+        }
+        self.heap[addr..addr + repr.len()].copy_from_slice(repr.as_slice());
         Ok(())
     }
 }
@@ -154,7 +224,7 @@ impl Interpreter {
     }
 
     fn access_variable(&mut self, name: &Identifier) -> Result<Value> {
-        self.lookup(name).cloned()
+        self.lookup(name)
     }
 
     fn access_field(&mut self, object: &AST, field: &Identifier) -> Result<Value> {
@@ -169,7 +239,7 @@ impl Interpreter {
         let v = self.eval(value)?;
         match self.env.get(name) {
             Some(addr) => {
-                self.heap.insert(*addr, v);
+                self.set(*addr, v);
                 Ok(())
             },
             None => Err(anyhow!(
