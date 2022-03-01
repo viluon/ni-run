@@ -62,10 +62,14 @@ impl Interpreter {
         match self.env.get(id) {
             Some(addr) => match self.heap.get(addr) {
                 Some(v) => Ok(v),
-                None => Err(anyhow!("interpreter bug: {} points to address {} (outside heap)", id.0, addr)),
+                None => Err(anyhow!(
+                    "interpreter bug: {} points to address {} (outside the heap). \
+                    Whoever wrote this thing screwed up, big time.", id.0, addr
+                )),
             },
             None => Err(anyhow!(
-                "it's generally considered smarter to define variables like {} before trying to access them.", id.0
+                "it's generally considered smarter to define variables \
+                (such as {}) before trying to access them.", id.0
             ))
         }
     }
@@ -78,7 +82,7 @@ impl Interpreter {
 
 impl Interpreter {
     fn top(&mut self, statements: &[AST]) -> Result<Value> {
-        statements.iter().fold(Ok(Value::Null), |_, s| self.eval(s))
+        statements.iter().fold(Ok(Value::Null), |acc, s| acc.and(self.eval(s)))
     }
 
     fn block(&mut self, statements: &[AST]) -> Result<Value> {
@@ -106,7 +110,7 @@ impl Interpreter {
             AST::AccessArray { array, index } =>
                 I::access_array(&**array, &**index),
             AST::AssignVariable { name, value } =>
-                I::assign_variable(name, &**value).map(|()| Value::Null),
+                self.assign_variable(name, &**value).map(|()| Value::Null),
             AST::AssignField { object, field, value } =>
                 I::assign_field(&**object, field, &**value),
             AST::AssignArray { array, index, value } =>
@@ -124,7 +128,7 @@ impl Interpreter {
             AST::Loop { condition, body } =>
                 self.loop_de_loop(&**condition, &**body).map(|()| Value::Null),
             AST::Conditional { condition, consequent, alternative } =>
-                self.conditional(&**condition, &**consequent, &**alternative).map(|()| Value::Null),
+                self.conditional(&**condition, &**consequent, &**alternative),
             AST::Print { format, arguments } =>
                 self.print(format, arguments),
         }
@@ -161,8 +165,17 @@ impl Interpreter {
         todo!()
     }
 
-    fn assign_variable(name: &Identifier, value: &AST) -> Result<()> {
-        todo!()
+    fn assign_variable(&mut self, name: &Identifier, value: &AST) -> Result<()> {
+        let v = self.eval(value)?;
+        match self.env.get(name) {
+            Some(addr) => {
+                self.heap.insert(*addr, v);
+                Ok(())
+            },
+            None => Err(anyhow!(
+                "you don't seem to understand how variable assignments work. {} is not defined.", name.0
+            )),
+        }
     }
 
     fn assign_field(object: &AST, field: &Identifier, value: &AST) -> Result<Value> {
@@ -183,7 +196,7 @@ impl Interpreter {
         match self.lookup(name)?.clone() {
             Value::Function { parameters, .. } if parameters.len() != arguments.len() =>
                 Err(anyhow!(
-                    "you should learn to count before writing a function like {}. It takes {} arguments, not {}.",
+                    "it helps to learn how to count before writing a function like {}. It takes {} arguments, not {}.",
                     name.0,
                     parameters.len(),
                     arguments.len()
@@ -206,7 +219,11 @@ impl Interpreter {
                 self.env = env;
                 Ok(result)
             },
-            v => Err(anyhow!("{} is not a function (cannot call {})", name.0, v)),
+            v => Err(anyhow!(
+                "you tried to call {}, but it didn't work. Maybe you didn't try hard enough, or \
+                maybe the stars aren't aligned right today, or maybe it's the fact that {} holds \
+                a value of {}, not a function. Who knows?", name.0, name.0, v
+            )),
         }
     }
 
@@ -216,20 +233,21 @@ impl Interpreter {
 
     fn loop_de_loop(&mut self, condition: &AST, body: &AST) -> Result<()> {
         while (self.eval(condition)?).as_bool(|v| anyhow!(
-            "loop condition must be a boolean. Do you think {} is a boolean?", v
+            "the difference between your program and most others \
+            is that other people tend to put booleans as their loop conditions. \
+            Using a value of {} instead may just become the next big thing. Keep at it.", v
         ))? {
             self.eval(body)?;
         }
         Ok(())
     }
 
-    fn conditional(&mut self, condition: &AST, consequent: &AST, alternative: &AST) -> Result<()> {
+    fn conditional(&mut self, condition: &AST, consequent: &AST, alternative: &AST) -> Result<Value> {
         match self.eval(condition)? {
             Value::Bool(true) => self.eval(consequent),
             Value::Bool(false) => self.eval(alternative),
             v => Err(anyhow!("you're trying to branch on a {}. Do you really think that's a good idea?", v)),
-        }?;
-        Ok(())
+        }
     }
 
     fn print(&mut self, format: &str, arguments: &[AST]) -> Result<Value> {
@@ -256,7 +274,11 @@ impl Interpreter {
                         arg_index += 1
                     },
                     None => {
-                        err = Some("too few arguments for format string".to_string());
+                        err = Some("\
+                            the little wavy symbols in your format string are trying to read \
+                            the arguments that come after it. Try putting enough arguments in, \
+                            see what happens.".to_string()
+                        );
                         break
                     },
                 },
@@ -267,7 +289,9 @@ impl Interpreter {
                     escape = false
                 },
                 (true, _) => {
-                    err = Some(format!("invalid escape sequence: \\{}", ch));
+                    err = Some(format!(
+                        "you can try escaping {} as much as you like, it's not going to work.", ch
+                    ));
                     break
                 },
             }
@@ -275,7 +299,9 @@ impl Interpreter {
 
         match err {
             Some(err) => Err(anyhow!(err)),
-            None if escape => Err(anyhow!("invalid escape sequence: \\")),
+            None if escape => Err(anyhow!(
+                "honestly, backslashes at the end of format strings shouldn't even make it through the parser."
+            )),
             None => {
                 println!("{}", str);
                 Ok(Value::Null)
