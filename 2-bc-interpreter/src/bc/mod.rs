@@ -59,13 +59,13 @@ impl Constant {
 }
 
 #[derive(Debug, Clone)]
-enum Kind {
+enum Layout {
     Nullary,
     Constant(u16),
     ConstantAndByte(u16, u8),
 }
 
-type BcInstr = (Opcode, Kind);
+type BcInstr = (Opcode, Layout);
 
 fn parse_code<'a, It: Iterator<Item = &'a u8>>(iter: &mut It, len: u32) -> Result<Vec<Instr>> {
     (0..len).map(|_| parse_instr(iter)?.ok_or_else(eos)).collect()
@@ -73,19 +73,16 @@ fn parse_code<'a, It: Iterator<Item = &'a u8>>(iter: &mut It, len: u32) -> Resul
 
 pub fn parse_constant_pool<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<(Vec<Constant>, Vec<Instr>)> {
     let len = next_u16(bc)?;
-    println!("constant pool len: {}", len);
     let mut constants = vec![];
     let mut code = vec![];
     for _ in 0..len {
         let &tag = bc.next().ok_or_else(eos)?;
-        println!("tag: {:?}", tag);
         let constant = match tag {
             0x01 => Constant::Null,
             0x06 => Constant::Boolean(bc.next().ok_or_else(eos)? == &0x01),
             0x00 => Constant::Integer(next_i32(bc)?),
             0x02 => {
                 let length = next_u32(bc)?;
-                eprintln!("length: {}", length);
                 let str = String::from_utf8(bc.take(length as usize).cloned().collect())?;
                 let actual_length = str.as_bytes().len();
                 (actual_length == length as usize).expect(|| anyhow!("expected {} bytes, got {}", length, actual_length))?;
@@ -106,9 +103,6 @@ pub fn parse_constant_pool<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Resu
             _ => return Err(anyhow!("Invalid constant tag: {}", tag)),
         };
         constants.push(constant);
-
-        println!("ks: {:?}", constants);
-        println!("code: {:?}", code);
     }
 
     Ok((constants, code))
@@ -141,9 +135,9 @@ fn parse_bc_instr<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Option
     if let Some(&opcode) = bc.next() {
         let opcode = Opcode::try_from(opcode)?;
         let kind = match opcode {
-            Opcode::Literal => Kind::constant(bc)?,
-            Opcode::Drop    => Kind::nullary(),
-            Opcode::Print   => Kind::constant_and_byte(bc)?,
+            Opcode::Literal => Layout::constant(bc)?,
+            Opcode::Drop    => Layout::nullary(),
+            Opcode::Print   => Layout::constant_and_byte(bc)?,
         };
         Ok(Some((opcode, kind)))
     } else {
@@ -184,19 +178,19 @@ impl From<Opcode> for u8 {
     }
 }
 
-impl Kind {
+impl Layout {
     fn nullary() -> Self {
-        Kind::Nullary
+        Layout::Nullary
     }
 
-    fn constant<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Kind> {
-        Ok(Kind::Constant(next_u16(bc)?))
+    fn constant<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Layout> {
+        Ok(Layout::Constant(next_u16(bc)?))
     }
 
-    fn constant_and_byte<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Kind> {
+    fn constant_and_byte<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Layout> {
         let k = next_u16(bc)?;
         let b = bc.next().ok_or_else(eos)?;
-        Ok(Kind::ConstantAndByte(k, *b))
+        Ok(Layout::ConstantAndByte(k, *b))
     }
 }
 
@@ -205,9 +199,9 @@ impl TryFrom<BcInstr> for Instr {
 
     fn try_from(bc_instr: BcInstr) -> Result<Self> {
         match bc_instr {
-            (Opcode::Literal, Kind::Constant(k)) => Ok(Instr::Literal(k)),
-            (Opcode::Drop,    Kind::Nullary) => Ok(Instr::Drop),
-            (Opcode::Print,   Kind::ConstantAndByte(k, b)) => Ok(Instr::Print(k, b)),
+            (Opcode::Literal, Layout::Constant(k)) => Ok(Instr::Literal(k)),
+            (Opcode::Drop,    Layout::Nullary) => Ok(Instr::Drop),
+            (Opcode::Print,   Layout::ConstantAndByte(k, b)) => Ok(Instr::Print(k, b)),
             _ => Err(anyhow!("invalid bc instr: {:?}", bc_instr)),
         }
     }

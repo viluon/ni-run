@@ -193,6 +193,11 @@ impl Interpreter {
     }
 
     fn execute(&mut self) -> Result<Value> {
+        if self.code.len() <= self.pc {
+            return Ok(Value::Null)
+            // return Err(anyhow!("program counter out of bounds"))
+        }
+
         match self.code[self.pc] {
             Instr::Literal(i) => {
                 self.push(match self.constant_pool[i as usize] {
@@ -203,7 +208,7 @@ impl Interpreter {
                     Constant::Slot(_) => Err(anyhow!("attempt to push a slot to the stack")),
                     Constant::Method { .. } => Err(anyhow!("attempt to push a method to the stack")),
                 }?)?;
-                Ok(Value::Null)
+                Ok(Value::Null) as Result<Value>
             },
             Instr::Drop => {
                 self.pop()?;
@@ -212,9 +217,14 @@ impl Interpreter {
             Instr::Print(idx, n_args) => {
                 let args = (0..n_args).map(|_| self.pop()).collect::<Result<Vec<_>>>()?;
                 let format_string = self.constant_pool[idx as usize].as_string()?;
-                self.print(&format_string, &args)
+                self.print(&format_string, &args.into_iter().rev().collect_vec())?;
+                self.push(Value::Null)?;
+                Ok(Value::Null)
             },
-        }
+        }?;
+
+        self.pc += 1;
+        self.execute()
     }
 
     fn integer(i: i32)  -> Value { Value::Int(i) }
