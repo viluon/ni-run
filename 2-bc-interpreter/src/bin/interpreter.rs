@@ -1,6 +1,7 @@
 #![feature(fn_traits, associated_type_defaults)]
 
 use std::{io::Read, collections::BTreeMap, fmt::Display};
+use itertools::Itertools;
 use anyhow::Result;
 use anyhow::anyhow;
 
@@ -92,26 +93,40 @@ impl Display for Value {
     }
 }
 
+const STACK_LIMIT: usize = 1024;
+
 #[derive(Debug, Default, Clone)]
 struct Interpreter {
-    env: BTreeMap<Identifier, usize>,
-    heap: Vec<u8>,
+    constant_pool: Vec<Constant>,
     code: Vec<Instr>,
+    env: BTreeMap<Identifier, usize>,
     stack: Vec<Value>,
+    heap: Vec<u8>,
     pc: usize,
 }
 
-use Interpreter as I;
-
 impl Interpreter {
-    fn new(code: Vec<Instr>) -> Interpreter {
-        Interpreter {
+    fn load<B: std::io::Read>(buf: &mut B) -> Result<Interpreter> {
+        let mut input = Vec::new();
+        buf.read_to_end(&mut input)?;
+        let mut iter = input.iter();
+        let (constant_pool, code) = bc::parse_constant_pool(&mut iter)?;
+        let globals = bc::parse_globals(&mut iter)?;
+        let entry_point = bc::parse_entry_point(&mut iter)?;
+
+        let pc = match &constant_pool[entry_point as usize] {
+            Constant::Method { name_idx: _, n_args: _, n_locals: _, start, length: _ } => Ok(*start),
+            _ => Err(anyhow!("Invalid entry point")),
+        }?;
+
+        Ok(Interpreter {
             env: BTreeMap::new(),
-            heap: vec![],
-            code,
             stack: vec![],
-            pc: 0,
-        }
+            heap: vec![],
+            constant_pool,
+            code,
+            pc,
+        })
     }
 
     fn alloc(&mut self, v: &Value) -> Result<usize> {
@@ -155,31 +170,63 @@ impl Interpreter {
         self.heap[addr..addr + repr.len()].copy_from_slice(repr.as_slice());
         Ok(())
     }
-}
 
-impl Interpreter {
-    fn top(&mut self, statements: &[AST]) -> Result<Value> {
-        statements.iter().fold(Ok(Value::Null), |acc, s| acc.and(self.eval(s)))
+    // fn top(&mut self, statements: &[AST]) -> Result<Value> {
+    //     statements.iter().fold(Ok(Value::Null), |acc, s| acc.and(self.eval(s)))
+    // }
+
+    // fn block(&mut self, statements: &[AST]) -> Result<Value> {
+    //     self.top(statements)
+    // }
+
+    fn push(&mut self, value: Value) -> Result<()> {
+        if self.stack.len() >= STACK_LIMIT {
+            Err(anyhow!("stack overflow"))
+        } else {
+            self.stack.push(value);
+            Ok(())
+        }
     }
 
-    fn block(&mut self, statements: &[AST]) -> Result<Value> {
-        self.top(statements)
+    fn pop(&mut self) -> Result<Value> {
+        self.stack.pop().ok_or_else(|| anyhow!("stack underflow"))
     }
 
     fn execute(&mut self) -> Result<Value> {
-        unimplemented!()
+        match self.code[self.pc] {
+            Instr::Literal(i) => {
+                self.push(match self.constant_pool[i as usize] {
+                    Constant::Null => Ok(Value::Null),
+                    Constant::Boolean(b) => Ok(Value::Bool(b)),
+                    Constant::Integer(n) => Ok(Value::Int(n)),
+                    Constant::String(_) => Err(anyhow!("attempt to push a string to the stack")),
+                    Constant::Slot(_) => Err(anyhow!("attempt to push a slot to the stack")),
+                    Constant::Method { .. } => Err(anyhow!("attempt to push a method to the stack")),
+                }?)?;
+                Ok(Value::Null)
+            },
+            Instr::Drop => {
+                self.pop()?;
+                Ok(Value::Null)
+            },
+            Instr::Print(idx, n_args) => {
+                let args = (0..n_args).map(|_| self.pop()).collect::<Result<Vec<_>>>()?;
+                let format_string = self.constant_pool[idx as usize].as_string()?;
+                self.print(&format_string, &args)
+            },
+        }
     }
 
     fn integer(i: i32)  -> Value { Value::Int(i) }
     fn boolean(b: bool) -> Value { Value::Bool(b) }
     fn null()           -> Value { Value::Null }
 
-    fn variable(&mut self, name: &Identifier, value: &AST) -> Result<Value> {
-        let v = self.eval(value)?;
-        let addr = self.alloc(&v)?;
-        self.env.insert(name.clone(), addr);
-        Ok(v)
-    }
+    // fn variable(&mut self, name: &Identifier, value: &AST) -> Result<Value> {
+    //     let v = self.eval(value)?;
+    //     let addr = self.alloc(&v)?;
+    //     self.env.insert(name.clone(), addr);
+    //     Ok(v)
+    // }
 
     fn array(&mut self, size: &AST, value: &AST) -> Result<Value> {
         todo!()
@@ -201,18 +248,18 @@ impl Interpreter {
         todo!()
     }
 
-    fn assign_variable(&mut self, name: &Identifier, value: &AST) -> Result<()> {
-        let v = self.eval(value)?;
-        match self.env.get(name) {
-            Some(addr) => {
-                self.set(*addr, &v)?;
-                Ok(())
-            },
-            None => Err(anyhow!(
-                "you don't seem to understand how variable assignments work. {} is not defined.", name.0
-            )),
-        }
-    }
+    // fn assign_variable(&mut self, name: &Identifier, value: &AST) -> Result<()> {
+    //     let v = self.eval(value)?;
+    //     match self.env.get(name) {
+    //         Some(addr) => {
+    //             self.set(*addr, &v)?;
+    //             Ok(())
+    //         },
+    //         None => Err(anyhow!(
+    //             "you don't seem to understand how variable assignments work. {} is not defined.", name.0
+    //         )),
+    //     }
+    // }
 
     fn assign_field(object: &AST, field: &Identifier, value: &AST) -> Result<Value> {
         todo!()
@@ -228,71 +275,65 @@ impl Interpreter {
         self.bind(name, addr)
     }
 
-    fn call_function(&mut self, name: &Identifier, arguments: &[AST]) -> Result<Value> {
-        match self.lookup(name)?.clone() {
-            Value::Function { parameters, .. } if parameters.len() != arguments.len() =>
-                Err(anyhow!(
-                    "it helps to learn how to count before writing a function like {}. It takes {} arguments, not {}.",
-                    name.0,
-                    parameters.len(),
-                    arguments.len()
-                )),
-            Value::Function { parameters, body } => {
-                let env = self.env.clone();
-                parameters
-                    .iter()
-                    .zip(arguments.iter())
-                    .map(|(n, expr)| self.eval(expr).map(|v| (n, v)))
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .try_for_each::<_, Result<()>>(|(name, v)| {
-                        let addr = self.alloc(&v)?;
-                        self.bind(name, addr)?;
-                        Ok(())
-                    })?;
+    // fn call_function(&mut self, name: &Identifier, arguments: &[AST]) -> Result<Value> {
+    //     match self.lookup(name)?.clone() {
+    //         Value::Function { parameters, .. } if parameters.len() != arguments.len() =>
+    //             Err(anyhow!(
+    //                 "it helps to learn how to count before writing a function like {}. It takes {} arguments, not {}.",
+    //                 name.0,
+    //                 parameters.len(),
+    //                 arguments.len()
+    //             )),
+    //         Value::Function { parameters, body } => {
+    //             let env = self.env.clone();
+    //             parameters
+    //                 .iter()
+    //                 .zip(arguments.iter())
+    //                 .map(|(n, expr)| self.eval(expr).map(|v| (n, v)))
+    //                 .collect::<Result<Vec<_>>>()?
+    //                 .into_iter()
+    //                 .try_for_each::<_, Result<()>>(|(name, v)| {
+    //                     let addr = self.alloc(&v)?;
+    //                     self.bind(name, addr)?;
+    //                     Ok(())
+    //                 })?;
 
-                let result = self.eval(&*body)?;
-                self.env = env;
-                Ok(result)
-            },
-            v => Err(anyhow!(
-                "you tried to call {}, but it didn't work. Maybe you didn't try hard enough, or \
-                maybe the stars aren't aligned right today, or maybe it's the fact that {} holds \
-                a value of {}, not a function. Who knows?", name.0, name.0, v
-            )),
-        }
-    }
+    //             let result = self.eval(&*body)?;
+    //             self.env = env;
+    //             Ok(result)
+    //         },
+    //         v => Err(anyhow!(
+    //             "you tried to call {}, but it didn't work. Maybe you didn't try hard enough, or \
+    //             maybe the stars aren't aligned right today, or maybe it's the fact that {} holds \
+    //             a value of {}, not a function. Who knows?", name.0, name.0, v
+    //         )),
+    //     }
+    // }
 
     fn call_method(object: &AST, name: &Identifier, arguments: &[AST]) -> Result<Value> {
         todo!()
     }
 
-    fn loop_de_loop(&mut self, condition: &AST, body: &AST) -> Result<()> {
-        while (self.eval(condition)?).as_bool(|v| anyhow!(
-            "the difference between your program and most others \
-            is that other people tend to put booleans as their loop conditions. \
-            Using a value of {} instead may just become the next big thing. Keep at it.", v
-        ))? {
-            self.eval(body)?;
-        }
-        Ok(())
-    }
+    // fn loop_de_loop(&mut self, condition: &AST, body: &AST) -> Result<()> {
+    //     while (self.eval(condition)?).as_bool(|v| anyhow!(
+    //         "the difference between your program and most others \
+    //         is that other people tend to put booleans as their loop conditions. \
+    //         Using a value of {} instead may just become the next big thing. Keep at it.", v
+    //     ))? {
+    //         self.eval(body)?;
+    //     }
+    //     Ok(())
+    // }
 
-    fn conditional(&mut self, condition: &AST, consequent: &AST, alternative: &AST) -> Result<Value> {
-        match self.eval(condition)? {
-            Value::Bool(true) => self.eval(consequent),
-            Value::Bool(false) => self.eval(alternative),
-            v => Err(anyhow!("you're trying to branch on a {}. Do you really think that's a good idea?", v)),
-        }
-    }
+    // fn conditional(&mut self, condition: &AST, consequent: &AST, alternative: &AST) -> Result<Value> {
+    //     match self.eval(condition)? {
+    //         Value::Bool(true) => self.eval(consequent),
+    //         Value::Bool(false) => self.eval(alternative),
+    //         v => Err(anyhow!("you're trying to branch on a {}. Do you really think that's a good idea?", v)),
+    //     }
+    // }
 
-    fn print(&mut self, format: &str, arguments: &[AST]) -> Result<Value> {
-        let mut args = vec![];
-        for arg in arguments {
-                let v = self.eval(arg)?;
-                args.push(v)
-        }
-
+    fn print(&mut self, format: &str, args: &[Value]) -> Result<Value> {
         let mut escape = false;
         let mut str = String::new();
         let mut err = None;
@@ -347,13 +388,6 @@ impl Interpreter {
 }
 
 fn main() -> Result<()> {
-    // load json from stdin
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
-    let constant_pool = unimplemented!();
-    let globals = unimplemented!();
-    let entry_point = unimplemented!();
-    let code = bc::parse_code(input.as_bytes())?;
-    Interpreter::new(code).execute()?;
+    Interpreter::load(&mut std::io::stdin())?.execute()?;
     Ok(())
 }

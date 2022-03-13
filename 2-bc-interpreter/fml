@@ -1,8 +1,12 @@
 #!/bin/bash
-if [ "$1" = "run" ]
+
+set -euo pipefail
+
+if [ "$1" = "execute" ]
 then
-    $PARSER parse "$2" --format=json | ~/Projects/ni-run/tasks/1-ast-interpreter/target/release/interpreter
+    export RUST_BACKTRACE=1
+    cat "$2" | ~/Projects/ni-run/tasks/2-bc-interpreter/target/debug/interpreter
 else
-    echo "Unknown command: $1. Supported commands: run"
+    echo "Unknown command: $1. Supported commands: execute"
     exit 1
 fi

@@ -2,6 +2,8 @@ use anyhow::Result;
 use anyhow::anyhow;
 use itertools::Itertools;
 
+use crate::util::*;
+
 /*
 0x00	Label
 0x01	Literal
@@ -43,6 +45,17 @@ pub enum Constant {
     Boolean(bool),
     Integer(i32),
     String(String),
+    Slot(u16),
+    Method { name_idx: u16, n_args: u8, n_locals: u16, start: usize, length: usize },
+}
+
+impl Constant {
+    pub fn as_string(&self) -> Result<String> {
+        match self {
+            Constant::String(s) => Ok(s.clone()),
+            k => Err(anyhow!("expected string, got {:?}", k))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -54,22 +67,74 @@ enum Kind {
 
 type BcInstr = (Opcode, Kind);
 
-pub fn parse_code(bc: &[u8]) -> Result<Vec<Instr>> {
-    let mut iter = bc.iter();
-    let mut res = Vec::new();
-    while let Some(instr) = parse_instr(&mut iter)? {
-        res.push(instr)
-    }
-    Ok(res)
+fn parse_code<'a, It: Iterator<Item = &'a u8>>(iter: &mut It, len: u32) -> Result<Vec<Instr>> {
+    (0..len).map(|_| parse_instr(iter)?.ok_or_else(eos)).collect()
 }
 
-pub fn parse_constant_pool(bc: &[u8]) -> Result<Vec<Constant>> {
-    let mut iter = bc.iter();
-    let mut res = Vec::new();
-    while let Some(constant) = parse_constant(&mut iter)? {
-        res.push(constant)
+pub fn parse_constant_pool<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<(Vec<Constant>, Vec<Instr>)> {
+    let len = next_u16(bc)?;
+    println!("constant pool len: {}", len);
+    let mut constants = vec![];
+    let mut code = vec![];
+    for _ in 0..len {
+        let &tag = bc.next().ok_or_else(eos)?;
+        println!("tag: {:?}", tag);
+        let constant = match tag {
+            0x01 => Constant::Null,
+            0x06 => Constant::Boolean(bc.next().ok_or_else(eos)? == &0x01),
+            0x00 => Constant::Integer(next_i32(bc)?),
+            0x02 => {
+                let length = next_u32(bc)?;
+                eprintln!("length: {}", length);
+                let str = String::from_utf8(bc.take(length as usize).cloned().collect())?;
+                let actual_length = str.as_bytes().len();
+                (actual_length == length as usize).expect(|| anyhow!("expected {} bytes, got {}", length, actual_length))?;
+                Constant::String(str)
+            },
+            0x04 => Constant::Slot(next_u16(bc)?),
+            0x03 => {
+                let name_idx = next_u16(bc)?;
+                let n_args = *bc.next().ok_or_else(eos)?;
+                let n_locals = next_u16(bc)?;
+                let n_instr = next_u32(bc)?;
+                let start = code.len();
+                code.extend(parse_code(bc, n_instr)?);
+                let length = code.len() - start;
+
+                Constant::Method { name_idx, n_args, n_locals, start, length }
+            }
+            _ => return Err(anyhow!("Invalid constant tag: {}", tag)),
+        };
+        constants.push(constant);
+
+        println!("ks: {:?}", constants);
+        println!("code: {:?}", code);
     }
-    Ok(res)
+
+    Ok((constants, code))
+}
+
+pub fn parse_globals<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<Vec<u16>> {
+    let len = next_u16(iter)?;
+    (0..len).map(|_| next_u16(iter)).collect()
+}
+
+pub fn parse_entry_point<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<u16> {
+    next_u16(iter)
+}
+
+fn next_u16<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<u16, anyhow::Error> {
+    Ok(u16::from_le_bytes([*iter.next().ok_or_else(eos)?, *iter.next().ok_or_else(eos)?]))
+}
+
+fn next_u32<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<u32, anyhow::Error> {
+    let (&b1, &b2, &b3, &b4) = iter.next_tuple().ok_or_else(eos)?;
+    Ok(u32::from_le_bytes([b1, b2, b3, b4]))
+}
+
+fn next_i32<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<i32, anyhow::Error> {
+    let (&b1, &b2, &b3, &b4) = iter.next_tuple().ok_or_else(eos)?;
+    Ok(i32::from_le_bytes([b1, b2, b3, b4]))
 }
 
 fn parse_bc_instr<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Option<BcInstr>> {
@@ -90,25 +155,6 @@ fn parse_instr<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Option<In
     if let Some(bc_instr) = parse_bc_instr(bc)? {
         Ok(Some(bc_instr.try_into()?))
     } else { Ok(None) }
-}
-
-fn parse_constant<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Option<Constant>> {
-    if let Some(&tag) = bc.next() {
-        let tag = tag.try_into()?;
-        let constant = match tag {
-            0x01 => Constant::Null,
-            0x06 => Constant::Boolean(bc.next().ok_or_else(eos)? == &0x01),
-            0x00 => {
-                let (b1, b2, b3, b4, b5) = bc.next_tuple().ok_or_else(eos)?;
-                Constant::Integer(unimplemented!())
-            },
-            0x03 => Constant::String(unimplemented!()),
-            _    => return Err(anyhow!("Invalid constant tag: {}", tag)),
-        };
-        Ok(Some(constant))
-    } else {
-        Ok(None)
-    }
 }
 
 fn eos() -> anyhow::Error {
@@ -144,16 +190,11 @@ impl Kind {
     }
 
     fn constant<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Kind> {
-        let k = bc.next().ok_or_else(eos)?;
-        let k = (*k as u16) << 8;
-        let k = k | *bc.next().ok_or_else(eos)? as u16;
-        Ok(Kind::Constant(k))
+        Ok(Kind::Constant(next_u16(bc)?))
     }
 
     fn constant_and_byte<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Kind> {
-        let k = bc.next().ok_or_else(eos)?;
-        let k = (*k as u16) << 8;
-        let k = k | *bc.next().ok_or_else(eos)? as u16;
+        let k = next_u16(bc)?;
         let b = bc.next().ok_or_else(eos)?;
         Ok(Kind::ConstantAndByte(k, *b))
     }
