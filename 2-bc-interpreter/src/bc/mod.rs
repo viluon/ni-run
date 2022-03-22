@@ -30,6 +30,15 @@ pub enum Opcode {
     Literal,
     Drop,
     Print,
+    GetLocal,
+    SetLocal,
+    GetGlobal,
+    SetGlobal,
+    Label,
+    Jump,
+    Branch,
+    CallFunction,
+    Return,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -37,6 +46,15 @@ pub enum Instr {
     Literal(u16),
     Drop,
     Print(u16, u8),
+    GetLocal(u16),
+    SetLocal(u16),
+    GetGlobal(u16),
+    SetGlobal(u16),
+    Label(u16),
+    Jump(u16),
+    Branch(u16),
+    CallFunction(u16, u8),
+    Return,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -134,12 +152,21 @@ fn next_i32<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<i32, anyho
 fn parse_bc_instr<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Option<BcInstr>> {
     if let Some(&opcode) = bc.next() {
         let opcode = Opcode::try_from(opcode)?;
-        let kind = match opcode {
-            Opcode::Literal => Layout::constant(bc)?,
-            Opcode::Drop    => Layout::nullary(),
-            Opcode::Print   => Layout::constant_and_byte(bc)?,
+        let layout = match opcode {
+            Opcode::Literal      => Layout::constant(bc)?,
+            Opcode::Drop         => Layout::nullary(),
+            Opcode::Print        => Layout::constant_and_byte(bc)?,
+            Opcode::GetLocal     => Layout::constant(bc)?,
+            Opcode::SetLocal     => Layout::constant(bc)?,
+            Opcode::GetGlobal    => Layout::constant(bc)?,
+            Opcode::SetGlobal    => Layout::constant(bc)?,
+            Opcode::Label        => Layout::constant(bc)?,
+            Opcode::Jump         => Layout::constant(bc)?,
+            Opcode::Branch       => Layout::constant(bc)?,
+            Opcode::CallFunction => Layout::constant_and_byte(bc)?,
+            Opcode::Return       => Layout::nullary(),
         };
-        Ok(Some((opcode, kind)))
+        Ok(Some((opcode, layout)))
     } else {
         Ok(None)
     }
@@ -163,6 +190,15 @@ impl TryFrom<u8> for Opcode {
             0x01 => Ok(Opcode::Literal),
             0x10 => Ok(Opcode::Drop),
             0x02 => Ok(Opcode::Print),
+            0x00 => Ok(Opcode::Label),
+            0x08 => Ok(Opcode::CallFunction),
+            0x09 => Ok(Opcode::SetLocal),
+            0x0A => Ok(Opcode::GetLocal),
+            0x0B => Ok(Opcode::SetGlobal),
+            0x0C => Ok(Opcode::GetGlobal),
+            0x0D => Ok(Opcode::Branch),
+            0x0E => Ok(Opcode::Jump),
+            0x0F => Ok(Opcode::Return),
             _ => Err(anyhow!("invalid opcode: {}", value)),
         }
     }
@@ -174,6 +210,15 @@ impl From<Opcode> for u8 {
             Opcode::Literal => 0x01,
             Opcode::Drop => 0x10,
             Opcode::Print => 0x02,
+            Opcode::Label => 0x00,
+            Opcode::CallFunction => 0x08,
+            Opcode::SetLocal => 0x09,
+            Opcode::GetLocal => 0x0A,
+            Opcode::SetGlobal => 0x0B,
+            Opcode::GetGlobal => 0x0C,
+            Opcode::Branch => 0x0D,
+            Opcode::Jump => 0x0E,
+            Opcode::Return => 0x0F,
         }
     }
 }
@@ -199,9 +244,18 @@ impl TryFrom<BcInstr> for Instr {
 
     fn try_from(bc_instr: BcInstr) -> Result<Self> {
         match bc_instr {
-            (Opcode::Literal, Layout::Constant(k)) => Ok(Instr::Literal(k)),
-            (Opcode::Drop,    Layout::Nullary) => Ok(Instr::Drop),
-            (Opcode::Print,   Layout::ConstantAndByte(k, b)) => Ok(Instr::Print(k, b)),
+            (Opcode::Literal,      Layout::Constant(k)) => Ok(Instr::Literal(k)),
+            (Opcode::Drop,         Layout::Nullary) => Ok(Instr::Drop),
+            (Opcode::Print,        Layout::ConstantAndByte(k, b)) => Ok(Instr::Print(k, b)),
+            (Opcode::GetLocal,     Layout::Constant(k)) => Ok(Instr::GetLocal(k)),
+            (Opcode::SetLocal,     Layout::Constant(k)) => Ok(Instr::SetLocal(k)),
+            (Opcode::GetGlobal,    Layout::Constant(k)) => Ok(Instr::GetGlobal(k)),
+            (Opcode::SetGlobal,    Layout::Constant(k)) => Ok(Instr::SetGlobal(k)),
+            (Opcode::Label,        Layout::Constant(k)) => Ok(Instr::Label(k)),
+            (Opcode::Jump,         Layout::Constant(k)) => Ok(Instr::Jump(k)),
+            (Opcode::Branch,       Layout::Constant(k)) => Ok(Instr::Branch(k)),
+            (Opcode::CallFunction, Layout::ConstantAndByte(k, b)) => Ok(Instr::CallFunction(k, b)),
+            (Opcode::Return,       Layout::Nullary) => Ok(Instr::Return),
             _ => Err(anyhow!("invalid bc instr: {:?}", bc_instr)),
         }
     }

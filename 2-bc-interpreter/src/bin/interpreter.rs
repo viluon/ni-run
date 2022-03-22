@@ -41,15 +41,15 @@ impl From<&Value> for Vec<u8> {
     }
 }
 
-impl From<Vec<u8>> for Value {
-    fn from(bytes: Vec<u8>) -> Self {
+impl From<&[u8]> for Value {
+    fn from(bytes: &[u8]) -> Self {
         let tag = bytes[0];
-        let bytes = bytes.into_iter().skip(1).collect::<Vec<u8>>();
+        let bytes = &bytes[1..];
         match tag {
-            1 => Value::Int(i32::from_le_bytes(bytes.as_slice()[..4].try_into().unwrap())),
+            1 => Value::Int(i32::from_le_bytes(bytes[..4].try_into().unwrap())),
             2 => Value::Bool(bytes[0] == 1),
             3 => {
-                let mut repr = bytes.as_slice();
+                let mut repr = bytes;
                 let num_params = u64::from_le_bytes(repr[..8].try_into().unwrap());
                 repr = &repr[8..];
                 let mut parameters = Vec::new();
@@ -95,14 +95,23 @@ impl Display for Value {
 
 const STACK_LIMIT: usize = 1024;
 
+type Pc = usize;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StackFrame {
+    locals: Vec<usize>,
+    return_address: Pc,
+}
+
 #[derive(Debug, Default, Clone)]
 struct Interpreter {
     constant_pool: Vec<Constant>,
     code: Vec<Instr>,
     env: BTreeMap<Identifier, usize>,
     stack: Vec<Value>,
+    call_stack: Vec<StackFrame>,
     heap: Vec<u8>,
-    pc: usize,
+    pc: Pc,
 }
 
 impl Interpreter {
@@ -122,6 +131,7 @@ impl Interpreter {
         Ok(Interpreter {
             env: BTreeMap::new(),
             stack: vec![],
+            call_stack: vec![],
             heap: vec![],
             constant_pool,
             code,
@@ -135,31 +145,15 @@ impl Interpreter {
         Ok(addr)
     }
 
-    fn lookup(&mut self, id: &Identifier) -> Result<Value> {
-        match self.env.get(id) {
-            Some(&addr) => match self.get(addr) {
-                Some(v) => Ok(v),
-                None => Err(anyhow!(
-                    "interpreter bug: {} points to address {} (outside the heap). \
-                    Whoever wrote this thing screwed up, big time.", id.0, addr
-                )),
-            },
-            None => Err(anyhow!(
-                "it's generally considered smarter to define variables \
-                (such as {}) before trying to access them.", id.0
-            ))
-        }
-    }
-
     fn bind(&mut self, id: &Identifier, addr: usize) -> Result<()> {
         self.env.insert(id.clone(), addr);
         Ok(())
     }
 
-    fn get(&self, addr: usize) -> Option<Value> {
+    fn get(&self, addr: usize) -> Result<Value> {
         if addr < self.heap.len() {
-            Some(Value::from(self.heap[addr..].to_vec()))
-        } else { None }
+            Ok(Value::from(&self.heap[addr..]))
+        } else { Err(anyhow!("invalid address: {:04x}", addr)) }
     }
 
     fn set(&mut self, addr: usize, v: &Value) -> Result<()> {
@@ -179,6 +173,10 @@ impl Interpreter {
     //     self.top(statements)
     // }
 
+    fn frame(&self) -> StackFrame {
+        self.call_stack.last().unwrap().clone()
+    }
+
     fn push(&mut self, value: Value) -> Result<()> {
         if self.stack.len() >= STACK_LIMIT {
             Err(anyhow!("stack overflow"))
@@ -193,7 +191,7 @@ impl Interpreter {
     }
 
     fn execute(&mut self) -> Result<Value> {
-        if self.code.len() <= self.pc {
+        if self.pc >= self.code.len() {
             return Ok(Value::Null)
             // return Err(anyhow!("program counter out of bounds"))
         }
@@ -204,9 +202,9 @@ impl Interpreter {
                     Constant::Null => Ok(Value::Null),
                     Constant::Boolean(b) => Ok(Value::Bool(b)),
                     Constant::Integer(n) => Ok(Value::Int(n)),
-                    Constant::String(_) => Err(anyhow!("attempt to push a string to the stack")),
-                    Constant::Slot(_) => Err(anyhow!("attempt to push a slot to the stack")),
-                    Constant::Method { .. } => Err(anyhow!("attempt to push a method to the stack")),
+                    Constant::String(_) => Err(anyhow!("attempt to push a string onto the stack")),
+                    Constant::Slot(_) => Err(anyhow!("attempt to push a slot onto the stack")),
+                    Constant::Method { .. } => Err(anyhow!("attempt to push a method onto the stack")),
                 }?)?;
                 Ok(Value::Null) as Result<Value>
             },
@@ -221,6 +219,19 @@ impl Interpreter {
                 self.push(Value::Null)?;
                 Ok(Value::Null)
             },
+            Instr::GetLocal(i) => {
+                let &addr = self.frame().locals.get(i as usize).ok_or_else(|| anyhow!("index {} out of range", i))?;
+                self.push(self.get(addr)?)?;
+                Ok(Value::Null)
+            },
+            Instr::SetLocal(_) => unimplemented!(),
+            Instr::GetGlobal(_) => unimplemented!(),
+            Instr::SetGlobal(_) => unimplemented!(),
+            Instr::Label(_) => unimplemented!(),
+            Instr::Jump(_) => unimplemented!(),
+            Instr::Branch(_) => unimplemented!(),
+            Instr::CallFunction(_, _) => unimplemented!(),
+            Instr::Return => unimplemented!(),
         }?;
 
         self.pc += 1;
@@ -244,10 +255,6 @@ impl Interpreter {
 
     fn object(extends: &AST, members: &[AST]) -> Result<Value> {
         todo!()
-    }
-
-    fn access_variable(&mut self, name: &Identifier) -> Result<Value> {
-        self.lookup(name)
     }
 
     fn access_field(&mut self, object: &AST, field: &Identifier) -> Result<Value> {

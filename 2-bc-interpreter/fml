@@ -2,10 +2,12 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)"
+
 if [ "$1" = "execute" ]
 then
     export RUST_BACKTRACE=1
-    cat "$2" | ~/Projects/ni-run/tasks/2-bc-interpreter/target/debug/interpreter
+    "$SCRIPT_DIR/target/debug/interpreter" < "$2"
 else
     echo "Unknown command: $1. Supported commands: execute"
     exit 1
