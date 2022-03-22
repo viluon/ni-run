@@ -1,6 +1,7 @@
 #![feature(fn_traits, associated_type_defaults)]
 
 use std::{io::Read, collections::BTreeMap, fmt::Display};
+use fml_bc_interpreter::util::BooleanAssertions;
 use itertools::Itertools;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -80,6 +81,10 @@ impl Value {
             v => Err(err(v)),
         }
     }
+
+    fn is_truthy(&self) -> bool {
+        !matches!(self, Value::Bool(false) | Value::Null)
+    }
 }
 
 impl Display for Value {
@@ -95,8 +100,6 @@ impl Display for Value {
 
 const STACK_LIMIT: usize = 1024;
 
-type Pc = usize;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StackFrame {
     locals: Vec<usize>,
@@ -106,8 +109,9 @@ struct StackFrame {
 #[derive(Debug, Default, Clone)]
 struct Interpreter {
     constant_pool: Vec<Constant>,
+    label_map: BTreeMap<String, Pc>,
+    global_map: BTreeMap<String, usize>,
     code: Vec<Instr>,
-    env: BTreeMap<Identifier, usize>,
     stack: Vec<Value>,
     call_stack: Vec<StackFrame>,
     heap: Vec<u8>,
@@ -122,20 +126,44 @@ impl Interpreter {
         let (constant_pool, code) = bc::parse_constant_pool(&mut iter)?;
         let globals = bc::parse_globals(&mut iter)?;
         let entry_point = bc::parse_entry_point(&mut iter)?;
+        let label_map = bc::collect_labels(&constant_pool[..], &code[..]);
 
         let pc = match &constant_pool[entry_point as usize] {
             Constant::Method { name_idx: _, n_args: _, n_locals: _, start, length: _ } => Ok(*start),
             _ => Err(anyhow!("Invalid entry point")),
         }?;
 
-        Ok(Interpreter {
-            env: BTreeMap::new(),
+        let global_names = globals.iter()
+            .map(|&i| constant_pool.get(i as usize)
+                .ok_or_else(|| anyhow!("could not allocate global, {} is outside the constant pool", i))
+                .and_then(Constant::as_string)
+            )
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut init = Interpreter {
             stack: vec![],
             call_stack: vec![],
             heap: vec![],
+            global_map: Default::default(),
             constant_pool,
+            label_map,
             code,
             pc,
+        };
+
+        let mut global_map = BTreeMap::new();
+        for name in global_names {
+            let addr = init.alloc(&Value::Null)?;
+            global_map.insert(name, addr);
+        }
+
+        Ok(Interpreter {
+            call_stack: vec![StackFrame {
+                locals: global_map.values().cloned().collect(),
+                return_address: 0,
+            }],
+            global_map,
+            ..init
         })
     }
 
@@ -143,11 +171,6 @@ impl Interpreter {
         let addr = self.heap.len();
         self.set(addr, v)?;
         Ok(addr)
-    }
-
-    fn bind(&mut self, id: &Identifier, addr: usize) -> Result<()> {
-        self.env.insert(id.clone(), addr);
-        Ok(())
     }
 
     fn get(&self, addr: usize) -> Result<Value> {
@@ -196,46 +219,158 @@ impl Interpreter {
             // return Err(anyhow!("program counter out of bounds"))
         }
 
+        let mut increment = true;
         match self.code[self.pc] {
             Instr::Literal(i) => {
-                self.push(match self.constant_pool[i as usize] {
-                    Constant::Null => Ok(Value::Null),
-                    Constant::Boolean(b) => Ok(Value::Bool(b)),
-                    Constant::Integer(n) => Ok(Value::Int(n)),
+                increment = false;
+                self.code[self.pc] = match self.constant_pool[i as usize] {
+                    Constant::Null => Ok(Instr::LiteralNull),
+                    Constant::Boolean(b) => Ok(Instr::LiteralBool(b)),
+                    Constant::Integer(n) => Ok(Instr::LiteralInt(n)),
                     Constant::String(_) => Err(anyhow!("attempt to push a string onto the stack")),
                     Constant::Slot(_) => Err(anyhow!("attempt to push a slot onto the stack")),
                     Constant::Method { .. } => Err(anyhow!("attempt to push a method onto the stack")),
-                }?)?;
-                Ok(Value::Null) as Result<Value>
+                }?;
+                Ok(()) as Result<()>
+            },
+            Instr::LiteralNull => {
+                self.push(Value::Null)?;
+                Ok(())
+            },
+            Instr::LiteralBool(b) => {
+                self.push(Value::Bool(b))?;
+                Ok(())
+            },
+            Instr::LiteralInt(n) => {
+                self.push(Value::Int(n))?;
+                Ok(())
             },
             Instr::Drop => {
                 self.pop()?;
-                Ok(Value::Null)
+                Ok(())
             },
             Instr::Print(idx, n_args) => {
                 let args = (0..n_args).map(|_| self.pop()).collect::<Result<Vec<_>>>()?;
                 let format_string = self.constant_pool[idx as usize].as_string()?;
                 self.print(&format_string, &args.into_iter().rev().collect_vec())?;
                 self.push(Value::Null)?;
-                Ok(Value::Null)
+                Ok(())
             },
             Instr::GetLocal(i) => {
-                let &addr = self.frame().locals.get(i as usize).ok_or_else(|| anyhow!("index {} out of range", i))?;
-                self.push(self.get(addr)?)?;
-                Ok(Value::Null)
+                self.push(self.get(self.addr_of_local(i)?)?)?;
+                Ok(())
             },
-            Instr::SetLocal(_) => unimplemented!(),
-            Instr::GetGlobal(_) => unimplemented!(),
-            Instr::SetGlobal(_) => unimplemented!(),
-            Instr::Label(_) => unimplemented!(),
-            Instr::Jump(_) => unimplemented!(),
-            Instr::Branch(_) => unimplemented!(),
-            Instr::CallFunction(_, _) => unimplemented!(),
-            Instr::Return => unimplemented!(),
+            Instr::SetLocal(i) => {
+                let v = self.pop()?;
+                self.set(self.addr_of_local(i)?, &v)?;
+                Ok(())
+            },
+            Instr::GetGlobal(i) => {
+                // replace with a direct dereference
+                increment = false;
+                let addr = self.global_map[&self.constant_pool[i as usize].as_string()?];
+                self.code[self.pc] = Instr::GetGlobalDirect(addr as u32);
+                Ok(())
+            },
+            Instr::GetGlobalDirect(addr) => {
+                self.push(self.get(addr as usize)?)?;
+                Ok(())
+            },
+            Instr::SetGlobal(i) => {
+                // replace with a direct set
+                increment = false;
+                let addr = self.global_map[&self.constant_pool[i as usize].as_string()?];
+                self.code[self.pc] = Instr::SetGlobalDirect(addr as u32);
+                Ok(())
+            },
+            Instr::SetGlobalDirect(addr) => {
+                let v = self.pop()?;
+                self.set(addr as usize, &v)?;
+                Ok(())
+            },
+            Instr::Label(_) => {
+                // erase the label
+                increment = false;
+                self.code.remove(self.pc);
+                // shift the label map values
+                self.label_map = self.label_map
+                    .iter()
+                    .map(|(k, &v)| (k.clone(), v - (v > self.pc) as usize))
+                    .collect();
+                Ok(())
+            },
+            Instr::Jump(i) => {
+                // replace with a direct jump
+                increment = false;
+                let label = self.constant_pool[i as usize].as_string()?;
+                let addr = self.label_map[&label];
+                self.code[self.pc] = Instr::JumpDirect(addr);
+                Ok(())
+            },
+            Instr::JumpDirect(target) => {
+                self.pc = target;
+                Ok(())
+            },
+            Instr::Branch(i) => {
+                // replace with a direct branch
+                increment = false;
+                let label = self.constant_pool[i as usize].as_string()?;
+                let addr = self.label_map[&label];
+                self.code[self.pc] = Instr::BranchDirect(addr);
+                Ok(())
+            },
+            Instr::BranchDirect(target) => {
+                let v = self.pop()?;
+                if v.is_truthy() {
+                    self.pc = target;
+                }
+                Ok(())
+            },
+            Instr::CallFunction(i, n_args) => {
+                let global_name = self.constant_pool[i as usize].as_string()?;
+                let fn_addr = self.global_map[&global_name];
+                let (_, arity, n_locals, start, _) = self.constant_pool[fn_addr].as_method()?;
+                (arity == n_args).expect(||
+                    anyhow!("arity mismatch, expected {} arguments, got {}", arity, n_args)
+                )?;
+
+                let args = (0..n_args)
+                    .map(|_| self.pop().and_then(|arg| self.alloc(&arg)))
+                    .collect::<Result<Vec<_>>>()?;
+
+                self.call_function(start, n_locals, &args)?;
+                Ok(())
+            },
+            Instr::Return => {
+                let StackFrame {
+                    return_address,
+                    locals: _,
+                } = self.call_stack.pop().unwrap();
+                (!self.call_stack.is_empty()).expect(||
+                    anyhow!("popped the global frame")
+                )?;
+
+                self.pc = return_address;
+                Ok(())
+            },
         }?;
 
-        self.pc += 1;
+        self.pc += increment as usize;
         self.execute()
+    }
+
+    fn call_function(&mut self, start: Pc, n_locals: u16, args: &[usize]) -> Result<()> {
+        let null_ptr = self.alloc(&Value::Null)?;
+        self.call_stack.push(StackFrame {
+            return_address: self.pc + 1,
+            locals: args.iter().rev().chain((0..n_locals).map(|_| &null_ptr)).copied().collect(),
+        });
+        self.pc = start;
+        Ok(())
+    }
+
+    fn addr_of_local(&self, i: u16) -> Result<usize> {
+        Ok(*self.frame().locals.get(i as usize).ok_or_else(|| anyhow!("index {} out of range", i))?)
     }
 
     fn integer(i: i32)  -> Value { Value::Int(i) }
@@ -284,12 +419,6 @@ impl Interpreter {
 
     fn assign_array(array: &AST, index: &AST, value: &AST) -> Result<Value> {
         todo!()
-    }
-
-    fn function(&mut self, name: &Identifier, parameters: &[Identifier], body: &AST) -> Result<()> {
-        let f = Value::Function { parameters: parameters.to_vec(), body: Box::new(body.clone()) };
-        let addr = self.alloc(&f)?;
-        self.bind(name, addr)
     }
 
     // fn call_function(&mut self, name: &Identifier, arguments: &[AST]) -> Result<Value> {

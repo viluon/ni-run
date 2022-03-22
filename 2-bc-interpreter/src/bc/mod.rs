@@ -1,6 +1,7 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use itertools::Itertools;
+use std::collections::BTreeMap;
 
 use crate::util::*;
 
@@ -41,18 +42,27 @@ pub enum Opcode {
     Return,
 }
 
+pub type Pc = usize;
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Instr {
     Literal(u16),
+    LiteralNull,
+    LiteralBool(bool),
+    LiteralInt(i32),
     Drop,
     Print(u16, u8),
     GetLocal(u16),
     SetLocal(u16),
     GetGlobal(u16),
+    GetGlobalDirect(u32),
     SetGlobal(u16),
+    SetGlobalDirect(u32),
     Label(u16),
     Jump(u16),
+    JumpDirect(Pc), // FIXME: bumps repr size
     Branch(u16),
+    BranchDirect(Pc), // ditto
     CallFunction(u16, u8),
     Return,
 }
@@ -64,7 +74,7 @@ pub enum Constant {
     Integer(i32),
     String(String),
     Slot(u16),
-    Method { name_idx: u16, n_args: u8, n_locals: u16, start: usize, length: usize },
+    Method { name_idx: u16, n_args: u8, n_locals: u16, start: Pc, length: usize },
 }
 
 impl Constant {
@@ -72,6 +82,14 @@ impl Constant {
         match self {
             Constant::String(s) => Ok(s.clone()),
             k => Err(anyhow!("expected string, got {:?}", k))
+        }
+    }
+
+    pub fn as_method(&self) -> Result<(u16, u8, u16, usize, usize)> {
+        match self {
+            Constant::Method { name_idx, n_args, n_locals, start, length } =>
+                Ok((*name_idx, *n_args, *n_locals, *start, *length)),
+            k => Err(anyhow!("expected method, got {:?}", k))
         }
     }
 }
@@ -133,6 +151,16 @@ pub fn parse_globals<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<V
 
 pub fn parse_entry_point<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<u16> {
     next_u16(iter)
+}
+
+pub fn collect_labels(constant_pool: &[Constant], code: &[Instr]) -> BTreeMap<String, Pc> {
+    code.iter().enumerate().filter_map(|(i, instr)| {
+        if let Instr::Label(name_idx) = instr {
+            if let Ok(name) = constant_pool[*name_idx as usize].as_string() {
+                Some((name, i as Pc))
+            } else { None }
+        } else { None }
+    }).collect()
 }
 
 fn next_u16<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<u16, anyhow::Error> {
