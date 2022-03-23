@@ -3,6 +3,8 @@
 use std::{collections::BTreeMap, fmt::Display};
 use fml_bc_interpreter::util::BooleanAssertions;
 use itertools::Itertools;
+use itertools::Either;
+use itertools::Either::{Left, Right};
 use anyhow::Result;
 use anyhow::anyhow;
 
@@ -76,7 +78,11 @@ struct StackFrame {
 struct Interpreter {
     constant_pool: Vec<Constant>,
     label_map: BTreeMap<String, Pc>,
-    global_map: BTreeMap<String, usize>,
+    // the keys are both heap addresses and constant pool indices,
+    // depending on whether the global is a variable or a function
+    global_map: BTreeMap<String, Either<usize, u16>>,
+    // globals vector from bytecode
+    globals: Vec<u16>,
     code: Vec<Instr>,
     stack: Vec<Value>,
     call_stack: Vec<StackFrame>,
@@ -104,6 +110,7 @@ impl Interpreter {
             call_stack: vec![],
             heap: vec![],
             global_map: Default::default(),
+            globals: vec![],
             constant_pool,
             label_map,
             code,
@@ -120,30 +127,29 @@ impl Interpreter {
     }
 
     fn init_with_globals(mut self, globals: Vec<u16>) -> Result<Interpreter> {
-        let safe_string = |i| -> Result<String> {
-            self.constant_pool.get(i as usize)
-                .ok_or_else(|| anyhow!("invalid global, {} is outside the constant pool", i))
-                .and_then(Constant::as_string)
-        };
-
-        let global_names = globals.iter()
-            .map(|&i| self.constant_pool.get(i as usize)
-                .ok_or_else(|| anyhow!("invalid global, {} is outside the constant pool", i))
-                .and_then(|k| match *k {
-                    Constant::Slot(i) => Ok(safe_string(i)?),
-                    Constant::Method { name_idx, .. } => Ok(safe_string(name_idx)?),
-                    _ => Err(anyhow!("Invalid global {:?}", k)),
-                })
-            )
-            .collect::<Result<Vec<_>>>()?;
-
         let mut global_map = BTreeMap::new();
-        for name in global_names {
-            let addr = self.alloc(&Value::Null)?;
-            global_map.insert(name, addr);
+        for &k_idx in globals.iter() {
+            self.constant_pool.get(k_idx as usize)
+                .ok_or_else(|| anyhow!("invalid global, {} is outside the constant pool", k_idx))
+                .cloned()
+                .and_then(|k| match k {
+                    Constant::Slot(i) => {
+                        let name = self.constant_pool.get(i as usize)
+                            .ok_or_else(|| anyhow!("invalid global, {} is outside the constant pool", i))
+                            .and_then(Constant::as_string)?;
+                        global_map.insert(name, Left(self.alloc(&Value::Null)?));
+                        Ok(())
+                    },
+                    Constant::Method { name_idx, .. } => self.constant_pool[name_idx as usize]
+                        .as_string()
+                        .map(|name| {
+                            global_map.insert(name, Right(k_idx));
+                        }),
+                    _ => Err(anyhow!("Invalid global {:?}", k)),
+                })?;
         }
 
-        Ok(Interpreter { global_map, ..self })
+        Ok(Interpreter { global_map, globals, ..self })
     }
 
     fn alloc(&mut self, v: &Value) -> Result<usize> {
@@ -205,8 +211,10 @@ impl Interpreter {
         #[cfg(debug_assertions)]
         {
             print!("pc: {pc}, globals: ", pc = self.pc);
-            for (name, addr) in self.global_map.iter() {
-                print!("{}.{}={} ", addr, name, self.get(*addr)?);
+            for (name, target) in self.global_map.iter() {
+                if let Left(addr) = target {
+                    print!("{}.{}={} ", addr, name, self.get(*addr)?);
+                }
             }
             println!("i: {instr:?}", instr = self.code[self.pc]);
             println!("\tstack: {:?}", self.stack);
@@ -267,7 +275,7 @@ impl Interpreter {
                 Ok(())
             },
             Instr::GetGlobalDirect(name) => {
-                self.push(self.get(self.global_map[&name] as usize)?)?;
+                self.push(self.get(self.global_map[&name].unwrap_left())?)?;
                 Ok(())
             },
             Instr::SetGlobal(i) => {
@@ -280,7 +288,7 @@ impl Interpreter {
             Instr::SetGlobalDirect(name) => {
                 let v = self.peek()?;
                 let addr = self.alloc(&v)?;
-                self.global_map.insert(name, addr);
+                self.global_map.insert(name, Left(addr));
                 Ok(())
             },
             Instr::Label(_) => unreachable!("labels should be removed by the label collection pass"),
@@ -314,9 +322,12 @@ impl Interpreter {
                 Ok(())
             },
             Instr::CallFunction(i, n_args) => {
+                increment = false;
                 let global_name = self.constant_pool[i as usize].as_string()?;
-                let fn_addr = self.global_map[&global_name];
-                let (_, arity, n_locals, start, _) = self.constant_pool[fn_addr].as_method()?;
+                let fn_addr = self.global_map[&global_name].right()
+                    .ok_or_else(|| anyhow!("attempt to call variable {}", global_name))?;
+
+                let (_, arity, n_locals, start, _) = self.constant_pool[fn_addr as usize].as_method()?;
                 (arity == n_args).expect(||
                     anyhow!("arity mismatch, expected {} arguments, got {}", arity, n_args)
                 )?;
@@ -329,6 +340,7 @@ impl Interpreter {
                 Ok(())
             },
             Instr::Return => {
+                increment = false;
                 let StackFrame {
                     return_address,
                     locals: _,
