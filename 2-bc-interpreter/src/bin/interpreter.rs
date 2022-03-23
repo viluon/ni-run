@@ -1,6 +1,6 @@
 #![feature(fn_traits, associated_type_defaults)]
 
-use std::{io::Read, collections::BTreeMap, fmt::Display};
+use std::{collections::BTreeMap, fmt::Display};
 use fml_bc_interpreter::util::BooleanAssertions;
 use itertools::Itertools;
 use anyhow::Result;
@@ -8,13 +8,11 @@ use anyhow::anyhow;
 
 use fml_bc_interpreter::*;
 use bc::*;
-use ast::*;
 
 #[derive(Debug, Clone)]
 enum Value {
     Int(i32),
     Bool(bool),
-    Function { parameters: Vec<Identifier>, body: Box<AST> },
     Null,
 }
 
@@ -23,18 +21,6 @@ impl From<&Value> for Vec<u8> {
         let (tag, mut repr) = match value {
             Value::Int(i) => (1, i.to_le_bytes().to_vec()),
             Value::Bool(b) => (2, vec![if *b { 1 } else { 0 }]),
-            Value::Function { parameters, body } => {
-                let mut bytes = Vec::new();
-                bytes.extend_from_slice(&(parameters.len() as u64).to_le_bytes());
-                for param in parameters {
-                    bytes.extend_from_slice(&param.0.len().to_le_bytes());
-                    bytes.extend_from_slice(param.0.as_bytes());
-                }
-                let serialised = serde_json::to_vec(&*body).unwrap();
-                bytes.extend_from_slice((serialised.len() as u64).to_le_bytes().as_slice());
-                bytes.extend_from_slice(serialised.as_slice());
-                (3, bytes)
-            }
             Value::Null => (4, vec![]),
         };
         repr.insert(0, tag);
@@ -49,25 +35,6 @@ impl From<&[u8]> for Value {
         match tag {
             1 => Value::Int(i32::from_le_bytes(bytes[..4].try_into().unwrap())),
             2 => Value::Bool(bytes[0] == 1),
-            3 => {
-                let mut repr = bytes;
-                let num_params = u64::from_le_bytes(repr[..8].try_into().unwrap());
-                repr = &repr[8..];
-                let mut parameters = Vec::new();
-                for _ in 0..num_params {
-                    let len = u64::from_le_bytes(repr[..8].try_into().unwrap());
-                    repr = &repr[8..];
-                    let param = String::from_utf8(repr[..len as usize].to_vec()).unwrap();
-                    parameters.push(Identifier(param));
-                    repr = &repr[len as usize..];
-                }
-                let num_body_bytes = u64::from_le_bytes(repr[..8].try_into().unwrap());
-                repr = &repr[8..];
-                let mut body_bytes = Vec::new();
-                body_bytes.extend_from_slice(&repr[..num_body_bytes as usize]);
-                let body = serde_json::from_slice(&body_bytes).unwrap();
-                Value::Function { parameters, body }
-            }
             4 => Value::Null,
             _ => panic!("Invalid value tag"),
         }
@@ -92,7 +59,6 @@ impl Display for Value {
         match *self {
             Value::Int(i) => write!(fmt, "{}", i),
             Value::Bool(b) => write!(fmt, "{}", b),
-            Value::Function { .. } => write!(fmt, "function"),
             Value::Null => write!(fmt, "null"),
         }
     }
@@ -126,19 +92,12 @@ impl Interpreter {
         let (constant_pool, code) = bc::parse_constant_pool(&mut iter)?;
         let globals = bc::parse_globals(&mut iter)?;
         let entry_point = bc::parse_entry_point(&mut iter)?;
-        let label_map = bc::collect_labels(&constant_pool[..], &code[..]);
+        let (code, label_map) = bc::collect_labels(&constant_pool[..], code)?;
 
-        let pc = match &constant_pool[entry_point as usize] {
-            Constant::Method { name_idx: _, n_args: _, n_locals: _, start, length: _ } => Ok(*start),
+        let (pc, init_locals) = match &constant_pool[entry_point as usize] {
+            Constant::Method { name_idx: _, n_args: _, n_locals, start, length: _ } => Ok((*start, *n_locals)),
             _ => Err(anyhow!("Invalid entry point")),
         }?;
-
-        let global_names = globals.iter()
-            .map(|&i| constant_pool.get(i as usize)
-                .ok_or_else(|| anyhow!("could not allocate global, {} is outside the constant pool", i))
-                .and_then(Constant::as_string)
-            )
-            .collect::<Result<Vec<_>>>()?;
 
         let mut init = Interpreter {
             stack: vec![],
@@ -151,20 +110,40 @@ impl Interpreter {
             pc,
         };
 
+        let bottom_frame = StackFrame {
+            locals: (0..init_locals).map(|_| init.alloc(&Value::Null)).collect::<Result<_>>()?,
+            return_address: 0,
+        };
+
+        init.call_stack.push(bottom_frame);
+        init.init_with_globals(globals)
+    }
+
+    fn init_with_globals(mut self, globals: Vec<u16>) -> Result<Interpreter> {
+        let safe_string = |i| -> Result<String> {
+            self.constant_pool.get(i as usize)
+                .ok_or_else(|| anyhow!("invalid global, {} is outside the constant pool", i))
+                .and_then(Constant::as_string)
+        };
+
+        let global_names = globals.iter()
+            .map(|&i| self.constant_pool.get(i as usize)
+                .ok_or_else(|| anyhow!("invalid global, {} is outside the constant pool", i))
+                .and_then(|k| match *k {
+                    Constant::Slot(i) => Ok(safe_string(i)?),
+                    Constant::Method { name_idx, .. } => Ok(safe_string(name_idx)?),
+                    _ => Err(anyhow!("Invalid global {:?}", k)),
+                })
+            )
+            .collect::<Result<Vec<_>>>()?;
+
         let mut global_map = BTreeMap::new();
         for name in global_names {
-            let addr = init.alloc(&Value::Null)?;
+            let addr = self.alloc(&Value::Null)?;
             global_map.insert(name, addr);
         }
 
-        Ok(Interpreter {
-            call_stack: vec![StackFrame {
-                locals: global_map.values().cloned().collect(),
-                return_address: 0,
-            }],
-            global_map,
-            ..init
-        })
+        Ok(Interpreter { global_map, ..self })
     }
 
     fn alloc(&mut self, v: &Value) -> Result<usize> {
@@ -196,8 +175,8 @@ impl Interpreter {
     //     self.top(statements)
     // }
 
-    fn frame(&self) -> StackFrame {
-        self.call_stack.last().unwrap().clone()
+    fn frame(&mut self) -> &mut StackFrame {
+        self.call_stack.last_mut().unwrap()
     }
 
     fn push(&mut self, value: Value) -> Result<()> {
@@ -213,14 +192,28 @@ impl Interpreter {
         self.stack.pop().ok_or_else(|| anyhow!("stack underflow"))
     }
 
+    fn peek(&self) -> Result<Value> {
+        self.stack.last().cloned().ok_or_else(|| anyhow!("stack underflow"))
+    }
+
     fn execute(&mut self) -> Result<Value> {
         if self.pc >= self.code.len() {
             return Ok(Value::Null)
             // return Err(anyhow!("program counter out of bounds"))
         }
 
+        #[cfg(debug_assertions)]
+        {
+            print!("pc: {pc}, globals: ", pc = self.pc);
+            for (name, addr) in self.global_map.iter() {
+                print!("{}.{}={} ", addr, name, self.get(*addr)?);
+            }
+            println!("i: {instr:?}", instr = self.code[self.pc]);
+            println!("\tstack: {:?}", self.stack);
+        }
+
         let mut increment = true;
-        match self.code[self.pc] {
+        match self.code[self.pc].clone() {
             Instr::Literal(i) => {
                 increment = false;
                 self.code[self.pc] = match self.constant_pool[i as usize] {
@@ -257,48 +250,40 @@ impl Interpreter {
                 Ok(())
             },
             Instr::GetLocal(i) => {
-                self.push(self.get(self.addr_of_local(i)?)?)?;
+                let addr = *self.addr_of_local(i)?;
+                self.push(self.get(addr)?)?;
                 Ok(())
             },
             Instr::SetLocal(i) => {
-                let v = self.pop()?;
-                self.set(self.addr_of_local(i)?, &v)?;
+                let v = self.peek()?;
+                *self.addr_of_local(i)? = self.alloc(&v)?;
                 Ok(())
             },
             Instr::GetGlobal(i) => {
                 // replace with a direct dereference
                 increment = false;
-                let addr = self.global_map[&self.constant_pool[i as usize].as_string()?];
-                self.code[self.pc] = Instr::GetGlobalDirect(addr as u32);
+                let name = self.constant_pool[i as usize].as_string()?;
+                self.code[self.pc] = Instr::GetGlobalDirect(name);
                 Ok(())
             },
-            Instr::GetGlobalDirect(addr) => {
-                self.push(self.get(addr as usize)?)?;
+            Instr::GetGlobalDirect(name) => {
+                self.push(self.get(self.global_map[&name] as usize)?)?;
                 Ok(())
             },
             Instr::SetGlobal(i) => {
                 // replace with a direct set
                 increment = false;
-                let addr = self.global_map[&self.constant_pool[i as usize].as_string()?];
-                self.code[self.pc] = Instr::SetGlobalDirect(addr as u32);
+                let name = self.constant_pool[i as usize].as_string()?;
+                self.code[self.pc] = Instr::SetGlobalDirect(name);
                 Ok(())
             },
-            Instr::SetGlobalDirect(addr) => {
-                let v = self.pop()?;
-                self.set(addr as usize, &v)?;
+            Instr::SetGlobalDirect(name) => {
+                let v = self.peek()?;
+                let addr = self.alloc(&v)?;
+                self.global_map.insert(name, addr);
                 Ok(())
             },
-            Instr::Label(_) => {
-                // erase the label
-                increment = false;
-                self.code.remove(self.pc);
-                // shift the label map values
-                self.label_map = self.label_map
-                    .iter()
-                    .map(|(k, &v)| (k.clone(), v - (v > self.pc) as usize))
-                    .collect();
-                Ok(())
-            },
+            Instr::Label(_) => unreachable!("labels should be removed by the label collection pass"),
             Instr::Jump(i) => {
                 // replace with a direct jump
                 increment = false;
@@ -308,6 +293,7 @@ impl Interpreter {
                 Ok(())
             },
             Instr::JumpDirect(target) => {
+                increment = false;
                 self.pc = target;
                 Ok(())
             },
@@ -322,6 +308,7 @@ impl Interpreter {
             Instr::BranchDirect(target) => {
                 let v = self.pop()?;
                 if v.is_truthy() {
+                    increment = false;
                     self.pc = target;
                 }
                 Ok(())
@@ -369,13 +356,9 @@ impl Interpreter {
         Ok(())
     }
 
-    fn addr_of_local(&self, i: u16) -> Result<usize> {
-        Ok(*self.frame().locals.get(i as usize).ok_or_else(|| anyhow!("index {} out of range", i))?)
+    fn addr_of_local(&mut self, i: u16) -> Result<&mut usize> {
+        self.frame().locals.get_mut(i as usize).ok_or_else(|| anyhow!("index {} out of range", i))
     }
-
-    fn integer(i: i32)  -> Value { Value::Int(i) }
-    fn boolean(b: bool) -> Value { Value::Bool(b) }
-    fn null()           -> Value { Value::Null }
 
     // fn variable(&mut self, name: &Identifier, value: &AST) -> Result<Value> {
     //     let v = self.eval(value)?;
@@ -383,22 +366,6 @@ impl Interpreter {
     //     self.env.insert(name.clone(), addr);
     //     Ok(v)
     // }
-
-    fn array(&mut self, size: &AST, value: &AST) -> Result<Value> {
-        todo!()
-    }
-
-    fn object(extends: &AST, members: &[AST]) -> Result<Value> {
-        todo!()
-    }
-
-    fn access_field(&mut self, object: &AST, field: &Identifier) -> Result<Value> {
-        todo!()
-    }
-
-    fn access_array(array: &AST, index: &AST) -> Result<Value> {
-        todo!()
-    }
 
     // fn assign_variable(&mut self, name: &Identifier, value: &AST) -> Result<()> {
     //     let v = self.eval(value)?;
@@ -412,14 +379,6 @@ impl Interpreter {
     //         )),
     //     }
     // }
-
-    fn assign_field(object: &AST, field: &Identifier, value: &AST) -> Result<Value> {
-        todo!()
-    }
-
-    fn assign_array(array: &AST, index: &AST, value: &AST) -> Result<Value> {
-        todo!()
-    }
 
     // fn call_function(&mut self, name: &Identifier, arguments: &[AST]) -> Result<Value> {
     //     match self.lookup(name)?.clone() {
@@ -455,10 +414,6 @@ impl Interpreter {
     //         )),
     //     }
     // }
-
-    fn call_method(object: &AST, name: &Identifier, arguments: &[AST]) -> Result<Value> {
-        todo!()
-    }
 
     // fn loop_de_loop(&mut self, condition: &AST, body: &AST) -> Result<()> {
     //     while (self.eval(condition)?).as_bool(|v| anyhow!(
@@ -534,6 +489,12 @@ impl Interpreter {
 }
 
 fn main() -> Result<()> {
-    Interpreter::load(&mut std::io::stdin())?.execute()?;
-    Ok(())
+    let mut i = Interpreter::load(&mut std::io::stdin())?;
+    match i.execute() {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("interpreter crash:\n{:#?}", i);
+            Err(e)
+        }
+    }
 }

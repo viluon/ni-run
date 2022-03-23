@@ -55,9 +55,9 @@ pub enum Instr {
     GetLocal(u16),
     SetLocal(u16),
     GetGlobal(u16),
-    GetGlobalDirect(u32),
+    GetGlobalDirect(String),
     SetGlobal(u16),
-    SetGlobalDirect(u32),
+    SetGlobalDirect(String),
     Label(u16),
     Jump(u16),
     JumpDirect(Pc), // FIXME: bumps repr size
@@ -90,6 +90,13 @@ impl Constant {
             Constant::Method { name_idx, n_args, n_locals, start, length } =>
                 Ok((*name_idx, *n_args, *n_locals, *start, *length)),
             k => Err(anyhow!("expected method, got {:?}", k))
+        }
+    }
+
+    pub fn as_slot(&self) -> Result<u16> {
+        match self {
+            Constant::Slot(s) => Ok(*s),
+            k => Err(anyhow!("expected slot, got {:?}", k))
         }
     }
 }
@@ -153,14 +160,26 @@ pub fn parse_entry_point<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Resu
     next_u16(iter)
 }
 
-pub fn collect_labels(constant_pool: &[Constant], code: &[Instr]) -> BTreeMap<String, Pc> {
-    code.iter().enumerate().filter_map(|(i, instr)| {
+pub fn collect_labels(constant_pool: &[Constant], code: Vec<Instr>) -> Result<(Vec<Instr>, BTreeMap<String, Pc>)> {
+    let mut patched = vec![];
+    let mut labels = BTreeMap::new();
+
+    for (i, instr) in code.into_iter().enumerate() {
         if let Instr::Label(name_idx) = instr {
-            if let Ok(name) = constant_pool[*name_idx as usize].as_string() {
-                Some((name, i as Pc))
-            } else { None }
-        } else { None }
-    }).collect()
+            if let Ok(name) = constant_pool[name_idx as usize].as_string() {
+                labels.insert(name, patched.len() as Pc);
+            } else {
+                return Err(anyhow!(
+                    "could not find name for label at {} (real PC would be {}) ({} is not a valid index)",
+                    i, patched.len(), name_idx
+                ));
+            }
+        } else {
+            patched.push(instr);
+        }
+    }
+
+    Ok((patched, labels))
 }
 
 fn next_u16<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<u16, anyhow::Error> {
