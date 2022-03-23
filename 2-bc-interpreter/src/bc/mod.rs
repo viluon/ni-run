@@ -160,14 +160,23 @@ pub fn parse_entry_point<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Resu
     next_u16(iter)
 }
 
-pub fn collect_labels(constant_pool: &[Constant], code: Vec<Instr>) -> Result<(Vec<Instr>, BTreeMap<String, Pc>)> {
+pub fn collect_labels(constant_pool: &mut Vec<Constant>, code: Vec<Instr>)
+-> Result<(Vec<Instr>, BTreeMap<String, Pc>)> {
     let mut patched = vec![];
     let mut labels = BTreeMap::new();
 
     for (i, instr) in code.into_iter().enumerate() {
         if let Instr::Label(name_idx) = instr {
             if let Ok(name) = constant_pool[name_idx as usize].as_string() {
-                labels.insert(name, patched.len() as Pc);
+                let new_pc = patched.len() as Pc;
+                // offset all methods that start after this point
+                constant_pool.iter_mut().for_each(|c| {
+                    if let Constant::Method { start, length, .. } = c {
+                        if *start > new_pc { *start -= 1; }
+                        else if *start + *length > new_pc { *length -= 1; }
+                    }
+                });
+                labels.insert(name, new_pc);
             } else {
                 return Err(anyhow!(
                     "could not find name for label at {} (real PC would be {}) ({} is not a valid index)",

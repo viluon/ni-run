@@ -95,12 +95,13 @@ impl Interpreter {
         let mut input = Vec::new();
         buf.read_to_end(&mut input)?;
         let mut iter = input.iter();
-        let (constant_pool, code) = bc::parse_constant_pool(&mut iter)?;
+        let (mut constant_pool, code) = bc::parse_constant_pool(&mut iter)?;
         let globals = bc::parse_globals(&mut iter)?;
-        let entry_point = bc::parse_entry_point(&mut iter)?;
-        let (code, label_map) = bc::collect_labels(&constant_pool[..], code)?;
+        let entry_point = bc::parse_entry_point(&mut iter)? as usize;
+        let (code, label_map) =
+            bc::collect_labels(&mut constant_pool, code)?;
 
-        let (pc, init_locals) = match &constant_pool[entry_point as usize] {
+        let (pc, init_locals) = match &constant_pool[entry_point] {
             Constant::Method { name_idx: _, n_args: _, n_locals, start, length: _ } => Ok((*start, *n_locals)),
             _ => Err(anyhow!("Invalid entry point")),
         }?;
