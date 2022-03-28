@@ -174,14 +174,6 @@ impl Interpreter {
         Ok(())
     }
 
-    // fn top(&mut self, statements: &[AST]) -> Result<Value> {
-    //     statements.iter().fold(Ok(Value::Null), |acc, s| acc.and(self.eval(s)))
-    // }
-
-    // fn block(&mut self, statements: &[AST]) -> Result<Value> {
-    //     self.top(statements)
-    // }
-
     fn frame(&mut self) -> &mut StackFrame {
         self.call_stack.last_mut().unwrap()
     }
@@ -372,80 +364,6 @@ impl Interpreter {
     fn addr_of_local(&mut self, i: u16) -> Result<&mut usize> {
         self.frame().locals.get_mut(i as usize).ok_or_else(|| anyhow!("index {} out of range", i))
     }
-
-    // fn variable(&mut self, name: &Identifier, value: &AST) -> Result<Value> {
-    //     let v = self.eval(value)?;
-    //     let addr = self.alloc(&v)?;
-    //     self.env.insert(name.clone(), addr);
-    //     Ok(v)
-    // }
-
-    // fn assign_variable(&mut self, name: &Identifier, value: &AST) -> Result<()> {
-    //     let v = self.eval(value)?;
-    //     match self.env.get(name) {
-    //         Some(addr) => {
-    //             self.set(*addr, &v)?;
-    //             Ok(())
-    //         },
-    //         None => Err(anyhow!(
-    //             "you don't seem to understand how variable assignments work. {} is not defined.", name.0
-    //         )),
-    //     }
-    // }
-
-    // fn call_function(&mut self, name: &Identifier, arguments: &[AST]) -> Result<Value> {
-    //     match self.lookup(name)?.clone() {
-    //         Value::Function { parameters, .. } if parameters.len() != arguments.len() =>
-    //             Err(anyhow!(
-    //                 "it helps to learn how to count before writing a function like {}. It takes {} arguments, not {}.",
-    //                 name.0,
-    //                 parameters.len(),
-    //                 arguments.len()
-    //             )),
-    //         Value::Function { parameters, body } => {
-    //             let env = self.env.clone();
-    //             parameters
-    //                 .iter()
-    //                 .zip(arguments.iter())
-    //                 .map(|(n, expr)| self.eval(expr).map(|v| (n, v)))
-    //                 .collect::<Result<Vec<_>>>()?
-    //                 .into_iter()
-    //                 .try_for_each::<_, Result<()>>(|(name, v)| {
-    //                     let addr = self.alloc(&v)?;
-    //                     self.bind(name, addr)?;
-    //                     Ok(())
-    //                 })?;
-
-    //             let result = self.eval(&*body)?;
-    //             self.env = env;
-    //             Ok(result)
-    //         },
-    //         v => Err(anyhow!(
-    //             "you tried to call {}, but it didn't work. Maybe you didn't try hard enough, or \
-    //             maybe the stars aren't aligned right today, or maybe it's the fact that {} holds \
-    //             a value of {}, not a function. Who knows?", name.0, name.0, v
-    //         )),
-    //     }
-    // }
-
-    // fn loop_de_loop(&mut self, condition: &AST, body: &AST) -> Result<()> {
-    //     while (self.eval(condition)?).as_bool(|v| anyhow!(
-    //         "the difference between your program and most others \
-    //         is that other people tend to put booleans as their loop conditions. \
-    //         Using a value of {} instead may just become the next big thing. Keep at it.", v
-    //     ))? {
-    //         self.eval(body)?;
-    //     }
-    //     Ok(())
-    // }
-
-    // fn conditional(&mut self, condition: &AST, consequent: &AST, alternative: &AST) -> Result<Value> {
-    //     match self.eval(condition)? {
-    //         Value::Bool(true) => self.eval(consequent),
-    //         Value::Bool(false) => self.eval(alternative),
-    //         v => Err(anyhow!("you're trying to branch on a {}. Do you really think that's a good idea?", v)),
-    //     }
-    // }
 
     fn print(&mut self, format: &str, args: &[Value]) -> Result<Value> {
         let mut escape = false;
