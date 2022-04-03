@@ -18,7 +18,7 @@ enum Value {
     Bool(bool),
     Reference(u64),
     Array(Vec<u64>), // TODO: copy on write?
-    Object { parent: u64, fields: BTreeMap<String, u64>, methods: BTreeMap<String, u16> },
+    Object { parent: u64, fields: Vec<(String, u64)>, methods: BTreeMap<String, u16> },
     Null,
 }
 
@@ -34,21 +34,25 @@ impl From<&Value> for Vec<u8> {
             Value::Null => (4, vec![]),
             Value::Reference(addr) => (5, addr.to_le_bytes().to_vec()),
             Value::Object { parent, fields, methods } => (6, {
-                // TODO this was copilot, check it
-                let mut repr = vec![
+                vec![
                     (parent.to_le_bytes().to_vec()),
                     (fields.len() as u64).to_le_bytes().to_vec(),
                     (methods.len() as u64).to_le_bytes().to_vec(),
-                ].concat();
-                for (k, v) in fields {
-                    repr.extend(k.as_bytes().to_vec());
-                    repr.extend(v.to_le_bytes().to_vec());
-                }
-                for (k, v) in methods {
-                    repr.extend(k.as_bytes().to_vec());
-                    repr.extend(v.to_le_bytes().to_vec());
-                }
-                repr
+                    fields.iter().flat_map(|(k, v)| {
+                        k.len().to_le_bytes().iter().copied()
+                            .chain(k.as_bytes().iter().copied()
+                                .chain(v.to_le_bytes().iter().copied())
+                            )
+                        .collect_vec()
+                    }).collect_vec(),
+                    methods.iter().flat_map(|(k, v)| {
+                        k.len().to_le_bytes().iter().copied()
+                            .chain(k.as_bytes().iter().copied()
+                                .chain(v.to_le_bytes().iter().copied())
+                            )
+                        .collect_vec()
+                    }).collect_vec(),
+                ].concat()
             }),
         };
         repr.insert(0, tag);
@@ -73,6 +77,29 @@ impl From<&[u8]> for Value {
             }),
             4 => Value::Null,
             5 => Value::Reference(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
+            6 => {
+                let parent = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                let len_fields = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+                let len_methods = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+                let mut bytes = &bytes[24..];
+                let mut fields = vec![];
+                let mut methods = BTreeMap::new();
+                for _ in 0..len_fields {
+                    let len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+                    let key = String::from_utf8(bytes[8..8 + len].try_into().unwrap()).unwrap();
+                    let value = u64::from_le_bytes(bytes[8 + len..16 + len].try_into().unwrap());
+                    fields.push((key, value));
+                    bytes = &bytes[16 + len..];
+                }
+                for _ in 0..len_methods {
+                    let len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+                    let key = String::from_utf8(bytes[8..8 + len].try_into().unwrap()).unwrap();
+                    let value = u16::from_le_bytes(bytes[8 + len..10 + len].try_into().unwrap());
+                    methods.insert(key, value);
+                    bytes = &bytes[10 + len..];
+                }
+                Value::Object { parent, fields, methods }
+            },
             _ => panic!("Invalid value tag"),
         }
     }
@@ -318,15 +345,20 @@ impl Interpreter {
             Value::Array(arr) => format!("[{}]", arr
                 .iter()
                 .map(|&addr| self.show(&self.get(addr as usize).unwrap()))
-                .collect::<Vec<_>>()
+                .collect_vec()
                 .join(", ")
             ),
             Value::Object { parent, fields, methods } => format!(
                 "object({})",
-                match self.get(*parent as usize).unwrap() {
-                    Value::Null => "".to_string(),
-                    obj => self.show(&obj),
-                }
+                (match self.get(*parent as usize).unwrap() {
+                    Value::Null => None,
+                    obj => Some(format!("..={}", self.show(&obj))),
+                }).into_iter().chain(fields
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, self.show(&self.get(*v as usize).unwrap())))
+                )
+                .collect_vec()
+                .join(", ")
             ),
             Value::Null => "null".to_string(),
         }
@@ -621,9 +653,10 @@ fn run(this: &mut Interpreter) -> Result<Value> {
                     .collect::<Result<Vec<_>>>()?;
 
                 members.sort_by_key(|p| p.0);
+                members.reverse();
+
                 let mut fields = vec![];
                 let mut methods = vec![];
-
                 for (method_index, slot) in members.into_iter() {
                     match slot {
                         Constant::Slot(i) => {
@@ -640,13 +673,15 @@ fn run(this: &mut Interpreter) -> Result<Value> {
                     }
                 }
 
+                fields.reverse();
+
                 // FIXME this is one of the places with the stack value / heap object distinction
                 let parent = this.pop()?;
                 let parent = this.alloc(&parent)? as u64;
 
                 this.push(Value::Object {
                     parent,
-                    fields: fields.into_iter().collect(),
+                    fields,
                     methods: methods.into_iter().collect(),
                 })
             },
