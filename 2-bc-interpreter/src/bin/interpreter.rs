@@ -18,6 +18,7 @@ enum Value {
     Bool(bool),
     Reference(u64),
     Array(Vec<u64>), // TODO: copy on write?
+    Object { parent: u64, fields: BTreeMap<String, u64>, methods: BTreeMap<String, u16> },
     Null,
 }
 
@@ -32,6 +33,23 @@ impl From<&Value> for Vec<u8> {
             ].concat()),
             Value::Null => (4, vec![]),
             Value::Reference(addr) => (5, addr.to_le_bytes().to_vec()),
+            Value::Object { parent, fields, methods } => (6, {
+                // TODO this was copilot, check it
+                let mut repr = vec![
+                    (parent.to_le_bytes().to_vec()),
+                    (fields.len() as u64).to_le_bytes().to_vec(),
+                    (methods.len() as u64).to_le_bytes().to_vec(),
+                ].concat();
+                for (k, v) in fields {
+                    repr.extend(k.as_bytes().to_vec());
+                    repr.extend(v.to_le_bytes().to_vec());
+                }
+                for (k, v) in methods {
+                    repr.extend(k.as_bytes().to_vec());
+                    repr.extend(v.to_le_bytes().to_vec());
+                }
+                repr
+            }),
         };
         repr.insert(0, tag);
         repr
@@ -61,28 +79,28 @@ impl From<&[u8]> for Value {
 }
 
 impl Value {
-    fn as_bool(&self, err: fn(&Value) -> anyhow::Error) -> Result<bool> {
+    fn as_bool<F: FnOnce(&Value) -> anyhow::Error>(&self, err: F) -> Result<bool> {
         match self {
             Value::Bool(b) => Ok(*b),
             v => Err(err(v)),
         }
     }
 
-    fn as_int(&self, err: fn(&Value) -> anyhow::Error) -> Result<i32> {
+    fn as_int<F: FnOnce(&Value) -> anyhow::Error>(&self, err: F) -> Result<i32> {
         match self {
             Value::Int(i) => Ok(*i),
             v => Err(err(v)),
         }
     }
 
-    fn as_array(&self, err: fn(&Value) -> anyhow::Error) -> Result<&Vec<u64>> {
+    fn as_array<F: FnOnce(&Value) -> anyhow::Error>(&self, err: F) -> Result<&Vec<u64>> {
         match self {
             Value::Array(v) => Ok(v),
             v => Err(err(v)),
         }
     }
 
-    fn as_reference(&self, err: fn(&Value) -> anyhow::Error) -> Result<u64> {
+    fn as_reference<F: FnOnce(&Value) -> anyhow::Error>(&self, err: F) -> Result<u64> {
         match self {
             Value::Reference(addr) => Ok(*addr),
             v => Err(err(v)),
@@ -91,18 +109,6 @@ impl Value {
 
     fn is_truthy(&self) -> bool {
         !matches!(self, Value::Bool(false) | Value::Null)
-    }
-}
-
-impl Display for Value {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Value::Int(i) => write!(fmt, "{}", i),
-            Value::Bool(b) => write!(fmt, "{}", b),
-            Value::Array(v) => write!(fmt, "array(len = {})", v.len()),
-            Value::Null => write!(fmt, "null"),
-            Value::Reference(addr) => write!(fmt, "reference({})", addr),
-        }
     }
 }
 
@@ -242,7 +248,7 @@ impl Interpreter {
     fn array_index(&self, arr: usize, i: u32) -> Result<usize> {
         let i = i as usize;
         let v = self.get(arr)?;
-        let arr = v.as_array(|v| anyhow!("expected an array, got {}", v))?;
+        let arr = v.as_array(|v| anyhow!("expected an array, got {}", self.show(&v)))?;
         (i < arr.len()).expect(|| anyhow!("array index out of bounds"))?;
         Ok(arr[i] as usize)
     }
@@ -274,8 +280,7 @@ impl Interpreter {
     fn call_method(&mut self, receiver: Value, name: String, args: &[Value]) -> Result<()> {
         if matches!(receiver, Value::Array(_) | Value::Int(_) | Value::Bool(_) | Value::Null) {
             // TODO check arity
-            let v = self.call_builtin_method(receiver, name.as_str(), args[0].clone())?;
-            self.push(v)?;
+            self.push(self.call_builtin_method(receiver, name.as_str(), args[0].clone())?)?;
             return Ok(());
         } else if let Some((array_addr, Value::Array(arr))) = self.deref(receiver)? {
             // TODO check arity
@@ -293,7 +298,7 @@ impl Interpreter {
                     self.push(v)?;
                 },
                 ("get" | "set", v) => return Err(anyhow!(
-                    "indexing an array with a {} might work in PHP, but it won't work here.", v
+                    "indexing an array with a {} might work in PHP, but it won't work here.", self.show(&v)
                 )),
                 (invalid, _) => return Err(anyhow!(
                     "this is actually the very first time someone thought to call {} on an array.", invalid
@@ -305,9 +310,34 @@ impl Interpreter {
         todo!()
     }
 
-    fn call_builtin_method(&mut self, receiver: Value, name: &str, arg: Value) -> Result<Value> {
+    fn show(&self, v: &Value) -> String {
+        match v {
+            Value::Int(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            &Value::Reference(addr) => self.show(&self.get(addr as usize).unwrap()),
+            Value::Array(arr) => format!("[{}]", arr
+                .iter()
+                .map(|&addr| self.show(&self.get(addr as usize).unwrap()))
+                .collect::<Vec<_>>()
+                .join(", ")
+            ),
+            Value::Object { parent, fields, methods } => format!(
+                "object({})",
+                match self.get(*parent as usize).unwrap() {
+                    Value::Null => "".to_string(),
+                    obj => self.show(&obj),
+                }
+            ),
+            Value::Null => "null".to_string(),
+        }
+    }
+
+    fn call_builtin_method(&self, receiver: Value, name: &str, arg: Value) -> Result<Value> {
         use Value::*;
-        match (name, receiver, arg) {
+        let unsupported = |name, r, arg|
+            anyhow!("unsupported builtin method {} for receiver {} with arg {}", name, self.show(&r), self.show(&arg));
+
+            match (name, receiver, arg) {
             ("+"  | "add", Int(a), Int(b)) => Ok(Int(a + b)),
             ("-"  | "sub", Int(a), Int(b)) => Ok(Int(a - b)),
             ("*"  | "mul", Int(a), Int(b)) => Ok(Int(a * b)),
@@ -317,8 +347,8 @@ impl Interpreter {
             (">"  | "gt",  Int(a), Int(b)) => Ok(Bool(a > b)),
             ("<=" | "le",  Int(a), Int(b)) => Ok(Bool(a <= b)),
             (">=" | "ge",  Int(a), Int(b)) => Ok(Bool(a >= b)),
-            ("&&" | "and", Bool(a), Bool(b)) => Ok(Bool(a && b)),
-            ("||" | "or",  Bool(a), Bool(b)) => Ok(Bool(a || b)),
+            ("&"  | "and", Bool(a), Bool(b)) => Ok(Bool(a && b)),
+            ("|"  | "or",  Bool(a), Bool(b)) => Ok(Bool(a || b)),
             ("==" | "eq",  Int(a), Int(b)) => Ok(Bool(a == b)),
             ("==" | "eq",  Int(_), _) => Ok(Bool(false)),
             ("==" | "eq",  Bool(a), Bool(b)) => Ok(Bool(a == b)),
@@ -329,8 +359,8 @@ impl Interpreter {
                 // TODO avoid cloning
                 self.call_builtin_method(r.clone(), "==", arg.clone()).map(
                     |bool_value| Bool(!bool_value.as_bool(|_| unreachable!()).unwrap())
-                ).map_err(|_| anyhow!("unsupported builtin method {} for receiver {} with arg {}", name, r, arg)),
-            (_, r, arg) => Err(anyhow!("unsupported builtin method {} for receiver {} with arg {}", name, r, arg)),
+                ).map_err(|_| unsupported(name, r, arg)),
+            (_, r, arg) => Err(unsupported(name, r, arg)),
         }
     }
 
@@ -362,7 +392,7 @@ impl Interpreter {
             match (escape, ch) {
                 (false, '~') => match args.get(arg_index) {
                     Some(arg) => {
-                        str.push_str(&arg.to_string());
+                        str.push_str(&self.show(&arg));
                         arg_index += 1
                     },
                     None => {
@@ -415,12 +445,12 @@ fn run(this: &mut Interpreter) -> Result<Value> {
             print!("pc: {pc}, globals: ", pc = this.pc);
             for (name, target) in this.global_map.iter() {
                 if let Left(addr) = target {
-                    print!("{}.{}={} ", addr, name, this.get(*addr)?);
+                    print!("{}.{}={} ", addr, name, this.show(&this.get(*addr)?));
                 }
             }
             print!(" locals: ");
             for (i, addr) in this.frame().locals.clone().into_iter().enumerate() {
-                print!("[{}]={} ", i, this.get(addr)?);
+                print!("[{}]={} ", i, this.show(&this.get(addr)?));
             }
             println!("i: {instr:?}", instr = this.code[this.pc]);
         }
@@ -532,7 +562,7 @@ fn run(this: &mut Interpreter) -> Result<Value> {
                 let name = this.constant_pool[i as usize].as_string()?;
                 let args = (0..n_args - 1).map(|_| this.pop()).collect::<Result<Vec<_>>>()?;
                 let receiver = this.pop()?;
-                this.call_method(receiver, name, &args)?;
+                this.call_method(receiver, name, &args.into_iter().rev().collect_vec())?;
                 Ok(())
             },
             Instr::CallFunction(i, n_args) => {
@@ -569,7 +599,7 @@ fn run(this: &mut Interpreter) -> Result<Value> {
             Instr::Array => {
                 let initial = this.pop()?;
                 let len = this.pop()?.as_int(
-                    |v| anyhow!("the length of an array must be an integer (not {})", v)
+                    |v| anyhow!("the length of an array must be an integer (not {})", this.show(v))
                 )?;
 
                 (len >= 0).expect(|| anyhow!("the length of an array must be non-negative"))?;
@@ -578,7 +608,48 @@ fn run(this: &mut Interpreter) -> Result<Value> {
                 let arr_addr = this.alloc(&Value::Array(vec![el_addr; len]))?;
 
                 this.push(Value::Reference(arr_addr as u64))
-            }
+            },
+            Instr::Object(class) => {
+                let mut members = this.constant_pool[class as usize].as_class()?
+                    .into_iter()
+                    .map(|i| (i, this.constant_pool[i as usize].clone()))
+                    .map(|(i, k)| match k {
+                        Constant::Method { .. } => Ok((i as i16, k)),
+                        Constant::Slot(_) => Ok((-1, k)),
+                        _ => Err(anyhow!("an object cannot contain a {:?}", k)),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                members.sort_by_key(|p| p.0);
+                let mut fields = vec![];
+                let mut methods = vec![];
+
+                for (method_index, slot) in members.into_iter() {
+                    match slot {
+                        Constant::Slot(i) => {
+                            let name = this.constant_pool[i as usize].as_string()?;
+                            let v = this.pop()?;
+                            let addr = this.alloc(&v)?;
+                            fields.push((name, addr as u64));
+                        },
+                        Constant::Method { name_idx, .. } => {
+                            let name = this.constant_pool[name_idx as usize].as_string()?;
+                            methods.push((name, method_index as u16))
+                        },
+                        _ => unreachable!(),
+                    }
+                }
+
+                // FIXME this is one of the places with the stack value / heap object distinction
+                let parent = this.pop()?;
+                let parent = this.alloc(&parent)? as u64;
+
+                this.push(Value::Object {
+                    parent,
+                    fields: fields.into_iter().collect(),
+                    methods: methods.into_iter().collect(),
+                })
+            },
         }?;
 
         this.pc += increment as usize;
@@ -624,6 +695,7 @@ fn main() -> Result<()> {
     }
 }
 
+#[cfg(test)]
 mod test {
     use std::io::Cursor;
     use super::*;

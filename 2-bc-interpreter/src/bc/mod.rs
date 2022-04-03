@@ -42,6 +42,7 @@ pub enum Opcode {
     CallFunction,
     Return,
     Array,
+    Object,
 }
 
 pub type Pc = usize;
@@ -69,6 +70,7 @@ pub enum Instr {
     CallFunction(u16, u8),
     Return,
     Array,
+    Object(u16),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -102,6 +104,13 @@ impl Constant {
         match self {
             Constant::Slot(s) => Ok(*s),
             k => Err(anyhow!("expected slot, got {:?}", k))
+        }
+    }
+
+    pub fn as_class(&self) -> Result<Vec<u16>> {
+        match self {
+            Constant::Class { member_indices } => Ok(member_indices.clone()),
+            k => Err(anyhow!("expected class, got {:?}", k))
         }
     }
 }
@@ -236,6 +245,7 @@ fn parse_bc_instr<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Option
             Opcode::CallFunction => Layout::constant_and_byte(bc)?,
             Opcode::Return       => Layout::nullary(),
             Opcode::Array        => Layout::nullary(),
+            Opcode::Object       => Layout::constant(bc)?,
         };
         Ok(Some((opcode, layout)))
     } else {
@@ -272,6 +282,7 @@ impl TryFrom<u8> for Opcode {
             0x0E => Ok(Opcode::Jump),
             0x0F => Ok(Opcode::Return),
             0x03 => Ok(Opcode::Array),
+            0x04 => Ok(Opcode::Object),
             _ => Err(anyhow!("invalid opcode: {}", value)),
         }
     }
@@ -294,6 +305,7 @@ impl From<Opcode> for u8 {
             Opcode::Jump         => 0x0E,
             Opcode::Return       => 0x0F,
             Opcode::Array        => 0x03,
+            Opcode::Object       => 0x04,
         }
     }
 }
@@ -333,6 +345,7 @@ impl TryFrom<BcInstr> for Instr {
             (Opcode::CallFunction, Layout::ConstantAndByte(k, b)) => Ok(Instr::CallFunction(k, b)),
             (Opcode::Return,       Layout::Nullary) => Ok(Instr::Return),
             (Opcode::Array,        Layout::Nullary) => Ok(Instr::Array),
+            (Opcode::Object,       Layout::Constant(k)) => Ok(Instr::Object(k)),
             _ => Err(anyhow!("invalid bc instr: {:?}", bc_instr)),
         }
     }
