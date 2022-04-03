@@ -38,8 +38,10 @@ pub enum Opcode {
     Label,
     Jump,
     Branch,
+    CallMethod,
     CallFunction,
     Return,
+    Array,
 }
 
 pub type Pc = usize;
@@ -63,8 +65,10 @@ pub enum Instr {
     JumpDirect(Pc), // FIXME: bumps repr size
     Branch(u16),
     BranchDirect(Pc), // ditto
+    CallMethod(u16, u8),
     CallFunction(u16, u8),
     Return,
+    Array,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -75,6 +79,7 @@ pub enum Constant {
     String(String),
     Slot(u16),
     Method { name_idx: u16, n_args: u8, n_locals: u16, start: Pc, length: usize },
+    Class { member_indices: Vec<u16> },
 }
 
 impl Constant {
@@ -121,9 +126,8 @@ pub fn parse_constant_pool<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Resu
     for _ in 0..len {
         let &tag = bc.next().ok_or_else(eos)?;
         let constant = match tag {
-            0x01 => Constant::Null,
-            0x06 => Constant::Boolean(bc.next().ok_or_else(eos)? == &0x01),
             0x00 => Constant::Integer(next_i32(bc)?),
+            0x01 => Constant::Null,
             0x02 => {
                 let length = next_u32(bc)?;
                 let str = String::from_utf8(bc.take(length as usize).cloned().collect())?;
@@ -131,7 +135,6 @@ pub fn parse_constant_pool<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Resu
                 (actual_length == length as usize).expect(|| anyhow!("expected {} bytes, got {}", length, actual_length))?;
                 Constant::String(str)
             },
-            0x04 => Constant::Slot(next_u16(bc)?),
             0x03 => {
                 let name_idx = next_u16(bc)?;
                 let n_args = *bc.next().ok_or_else(eos)?;
@@ -143,6 +146,16 @@ pub fn parse_constant_pool<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Resu
 
                 Constant::Method { name_idx, n_args, n_locals, start, length }
             }
+            0x04 => Constant::Slot(next_u16(bc)?),
+            0x05 => {
+                let n_members = next_u16(bc)?;
+                let member_indices = (0..n_members).map(|_| {
+                    next_u16(bc)
+                }).collect::<Result<_>>()?;
+
+                Constant::Class { member_indices }
+            },
+            0x06 => Constant::Boolean(bc.next().ok_or_else(eos)? == &0x01),
             _ => return Err(anyhow!("Invalid constant tag: {}", tag)),
         };
         constants.push(constant);
@@ -219,8 +232,10 @@ fn parse_bc_instr<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Option
             Opcode::Label        => Layout::constant(bc)?,
             Opcode::Jump         => Layout::constant(bc)?,
             Opcode::Branch       => Layout::constant(bc)?,
+            Opcode::CallMethod   => Layout::constant_and_byte(bc)?,
             Opcode::CallFunction => Layout::constant_and_byte(bc)?,
             Opcode::Return       => Layout::nullary(),
+            Opcode::Array        => Layout::nullary(),
         };
         Ok(Some((opcode, layout)))
     } else {
@@ -247,6 +262,7 @@ impl TryFrom<u8> for Opcode {
             0x10 => Ok(Opcode::Drop),
             0x02 => Ok(Opcode::Print),
             0x00 => Ok(Opcode::Label),
+            0x07 => Ok(Opcode::CallMethod),
             0x08 => Ok(Opcode::CallFunction),
             0x09 => Ok(Opcode::SetLocal),
             0x0A => Ok(Opcode::GetLocal),
@@ -255,6 +271,7 @@ impl TryFrom<u8> for Opcode {
             0x0D => Ok(Opcode::Branch),
             0x0E => Ok(Opcode::Jump),
             0x0F => Ok(Opcode::Return),
+            0x03 => Ok(Opcode::Array),
             _ => Err(anyhow!("invalid opcode: {}", value)),
         }
     }
@@ -263,18 +280,20 @@ impl TryFrom<u8> for Opcode {
 impl From<Opcode> for u8 {
     fn from(opcode: Opcode) -> Self {
         match opcode {
-            Opcode::Literal => 0x01,
-            Opcode::Drop => 0x10,
-            Opcode::Print => 0x02,
-            Opcode::Label => 0x00,
+            Opcode::Literal      => 0x01,
+            Opcode::Drop         => 0x10,
+            Opcode::Print        => 0x02,
+            Opcode::Label        => 0x00,
+            Opcode::CallMethod   => 0x07,
             Opcode::CallFunction => 0x08,
-            Opcode::SetLocal => 0x09,
-            Opcode::GetLocal => 0x0A,
-            Opcode::SetGlobal => 0x0B,
-            Opcode::GetGlobal => 0x0C,
-            Opcode::Branch => 0x0D,
-            Opcode::Jump => 0x0E,
-            Opcode::Return => 0x0F,
+            Opcode::SetLocal     => 0x09,
+            Opcode::GetLocal     => 0x0A,
+            Opcode::SetGlobal    => 0x0B,
+            Opcode::GetGlobal    => 0x0C,
+            Opcode::Branch       => 0x0D,
+            Opcode::Jump         => 0x0E,
+            Opcode::Return       => 0x0F,
+            Opcode::Array        => 0x03,
         }
     }
 }
@@ -310,8 +329,10 @@ impl TryFrom<BcInstr> for Instr {
             (Opcode::Label,        Layout::Constant(k)) => Ok(Instr::Label(k)),
             (Opcode::Jump,         Layout::Constant(k)) => Ok(Instr::Jump(k)),
             (Opcode::Branch,       Layout::Constant(k)) => Ok(Instr::Branch(k)),
+            (Opcode::CallMethod,   Layout::ConstantAndByte(k, b)) => Ok(Instr::CallMethod(k, b)),
             (Opcode::CallFunction, Layout::ConstantAndByte(k, b)) => Ok(Instr::CallFunction(k, b)),
             (Opcode::Return,       Layout::Nullary) => Ok(Instr::Return),
+            (Opcode::Array,        Layout::Nullary) => Ok(Instr::Array),
             _ => Err(anyhow!("invalid bc instr: {:?}", bc_instr)),
         }
     }

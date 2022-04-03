@@ -10,7 +10,11 @@ anyhow = "1.0.37"
 itertools = "0.10.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tailcall = "0.1.6"
 
 [dev-dependencies]
 quickcheck = "1"
 quickcheck_macros = "1"
+
+[profile.release]
+debug = true
