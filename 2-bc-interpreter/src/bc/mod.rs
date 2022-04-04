@@ -35,6 +35,8 @@ pub enum Opcode {
     SetLocal,
     GetGlobal,
     SetGlobal,
+    GetField,
+    SetField,
     Label,
     Jump,
     Branch,
@@ -61,6 +63,10 @@ pub enum Instr {
     GetGlobalDirect(String),
     SetGlobal(u16),
     SetGlobalDirect(String),
+    GetField(u16),
+    GetFieldDirect(String),
+    SetField(u16),
+    SetFieldDirect(String),
     Label(u16),
     Jump(u16),
     JumpDirect(Pc), // FIXME: bumps repr size
@@ -238,6 +244,8 @@ fn parse_bc_instr<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Result<Option
             Opcode::SetLocal     => Layout::constant(bc)?,
             Opcode::GetGlobal    => Layout::constant(bc)?,
             Opcode::SetGlobal    => Layout::constant(bc)?,
+            Opcode::GetField     => Layout::constant(bc)?,
+            Opcode::SetField     => Layout::constant(bc)?,
             Opcode::Label        => Layout::constant(bc)?,
             Opcode::Jump         => Layout::constant(bc)?,
             Opcode::Branch       => Layout::constant(bc)?,
@@ -283,6 +291,8 @@ impl TryFrom<u8> for Opcode {
             0x0F => Ok(Opcode::Return),
             0x03 => Ok(Opcode::Array),
             0x04 => Ok(Opcode::Object),
+            0x05 => Ok(Opcode::GetField),
+            0x06 => Ok(Opcode::SetField),
             _ => Err(anyhow!("invalid opcode: {}", value)),
         }
     }
@@ -306,6 +316,8 @@ impl From<Opcode> for u8 {
             Opcode::Return       => 0x0F,
             Opcode::Array        => 0x03,
             Opcode::Object       => 0x04,
+            Opcode::GetField     => 0x05,
+            Opcode::SetField     => 0x06,
         }
     }
 }
@@ -338,6 +350,8 @@ impl TryFrom<BcInstr> for Instr {
             (Opcode::SetLocal,     Layout::Constant(k)) => Ok(Instr::SetLocal(k)),
             (Opcode::GetGlobal,    Layout::Constant(k)) => Ok(Instr::GetGlobal(k)),
             (Opcode::SetGlobal,    Layout::Constant(k)) => Ok(Instr::SetGlobal(k)),
+            (Opcode::GetField,     Layout::Constant(k)) => Ok(Instr::GetField(k)),
+            (Opcode::SetField,     Layout::Constant(k)) => Ok(Instr::SetField(k)),
             (Opcode::Label,        Layout::Constant(k)) => Ok(Instr::Label(k)),
             (Opcode::Jump,         Layout::Constant(k)) => Ok(Instr::Jump(k)),
             (Opcode::Branch,       Layout::Constant(k)) => Ok(Instr::Branch(k)),

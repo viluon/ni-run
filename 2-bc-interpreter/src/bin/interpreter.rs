@@ -18,7 +18,7 @@ enum Value {
     Bool(bool),
     Reference(u64),
     Array(Vec<u64>), // TODO: copy on write?
-    Object { parent: u64, fields: Vec<(String, u64)>, methods: BTreeMap<String, u16> },
+    Object { parent: u64, fields: Vec<(u16, u64)>, methods: BTreeMap<u16, u16> },
     Null,
 }
 
@@ -33,27 +33,21 @@ impl From<&Value> for Vec<u8> {
             ].concat()),
             Value::Null => (4, vec![]),
             Value::Reference(addr) => (5, addr.to_le_bytes().to_vec()),
-            Value::Object { parent, fields, methods } => (6, {
-                vec![
-                    (parent.to_le_bytes().to_vec()),
-                    (fields.len() as u64).to_le_bytes().to_vec(),
-                    (methods.len() as u64).to_le_bytes().to_vec(),
-                    fields.iter().flat_map(|(k, v)| {
-                        k.len().to_le_bytes().iter().copied()
-                            .chain(k.as_bytes().iter().copied()
-                                .chain(v.to_le_bytes().iter().copied())
-                            )
-                        .collect_vec()
-                    }).collect_vec(),
-                    methods.iter().flat_map(|(k, v)| {
-                        k.len().to_le_bytes().iter().copied()
-                            .chain(k.as_bytes().iter().copied()
-                                .chain(v.to_le_bytes().iter().copied())
-                            )
-                        .collect_vec()
-                    }).collect_vec(),
-                ].concat()
-            }),
+            Value::Object { parent, fields, methods } => (6, {vec![
+                (parent.to_le_bytes().to_vec()),
+                (fields.len() as u64).to_le_bytes().to_vec(),
+                (methods.len() as u64).to_le_bytes().to_vec(),
+                fields.iter().flat_map(|(k, v)| {
+                    k.to_le_bytes().iter().copied()
+                    .chain(v.to_le_bytes().iter().copied())
+                    .collect_vec()
+                }).collect_vec(),
+                methods.iter().flat_map(|(k, v)| {
+                    k.to_le_bytes().iter().copied()
+                    .chain(v.to_le_bytes().iter().copied())
+                    .collect_vec()
+                }).collect_vec(),
+            ].concat()}),
         };
         repr.insert(0, tag);
         repr
@@ -85,18 +79,16 @@ impl From<&[u8]> for Value {
                 let mut fields = vec![];
                 let mut methods = BTreeMap::new();
                 for _ in 0..len_fields {
-                    let len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-                    let key = String::from_utf8(bytes[8..8 + len].try_into().unwrap()).unwrap();
-                    let value = u64::from_le_bytes(bytes[8 + len..16 + len].try_into().unwrap());
+                    let key = u16::from_le_bytes(bytes[..2].try_into().unwrap());
+                    let value = u64::from_le_bytes(bytes[2..10].try_into().unwrap());
                     fields.push((key, value));
-                    bytes = &bytes[16 + len..];
+                    bytes = &bytes[10..];
                 }
                 for _ in 0..len_methods {
-                    let len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-                    let key = String::from_utf8(bytes[8..8 + len].try_into().unwrap()).unwrap();
-                    let value = u16::from_le_bytes(bytes[8 + len..10 + len].try_into().unwrap());
+                    let key = u16::from_le_bytes(bytes[..2].try_into().unwrap());
+                    let value = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
                     methods.insert(key, value);
-                    bytes = &bytes[10 + len..];
+                    bytes = &bytes[4..];
                 }
                 Value::Object { parent, fields, methods }
             },
@@ -235,7 +227,7 @@ impl Interpreter {
     fn get(&self, addr: usize) -> Result<Value> {
         if addr < self.heap.len() {
             Ok(Value::from(&self.heap[addr..]))
-        } else { Err(anyhow!("invalid address: {:04x}", addr)) }
+        } else { Err(anyhow!("invalid address: {:#06x}", addr)) }
     }
 
     fn set(&mut self, addr: usize, v: &Value) -> Result<()> {
@@ -295,21 +287,21 @@ impl Interpreter {
         Ok(u64::from_le_bytes(heap[offset .. offset + 8].try_into().unwrap()))
     }
 
-    fn deref(&self, mut v: Value) -> Result<Option<(u64, Value)>> {
+    fn deref(&self, mut v: Value) -> Result<(u64, Value)> {
         let mut array_addr = None;
         while let Value::Reference(addr) = v {
             array_addr = Some(addr);
             v = self.get(addr as usize)?
         }
-        Ok(Some((array_addr.unwrap(), v)))
+        Ok((array_addr.ok_or_else(|| anyhow!("{:?} is not a reference!", v))?, v))
     }
 
     fn call_method(&mut self, receiver: Value, name: String, args: &[Value]) -> Result<()> {
         if matches!(receiver, Value::Array(_) | Value::Int(_) | Value::Bool(_) | Value::Null) {
             // TODO check arity
             self.push(self.call_builtin_method(receiver, name.as_str(), args[0].clone())?)?;
-            return Ok(());
-        } else if let Some((array_addr, Value::Array(arr))) = self.deref(receiver)? {
+            Ok(())
+        } else if let Ok((array_addr, Value::Array(arr))) = self.deref(receiver.clone()) {
             // TODO check arity
             match (name.as_str(), args[0].clone()) {
                 ("get", Value::Int(i)) => {
@@ -331,37 +323,70 @@ impl Interpreter {
                     "this is actually the very first time someone thought to call {} on an array.", invalid
                 )),
             }
-            return Ok(());
+            Ok(())
+        } else if let Ok((receiver_addr, Value::Object { parent, methods, fields: _ })) = self.deref(receiver.clone()) {
+            match methods.get(&self.string_index(name.as_str()).unwrap()) {
+                Some(&i) => {
+                    let (_name, n_args, n_locals, start, _len) = self.constant_pool[i as usize].as_method()?;
+                    (n_args as usize == args.len() + 1).expect(||
+                        anyhow!("wrong number of arguments, {} expects {}, not {}", name, n_args, args.len())
+                    )?;
+                    let allocated_args = args.iter().map(|v| self.alloc(v)).collect::<Result<Vec<_>>>()?;
+                    // FIXME not in the spec?
+                    self.push(Value::Reference(receiver_addr))?;
+                    self.call_function(start, n_locals, &(
+                        allocated_args.into_iter().chain(std::iter::once(receiver_addr as usize))
+                    ).collect_vec())
+                },
+                None => todo!(),
+            }
+        } else {
+            Err(anyhow!("cannot call method on {}", self.show(&receiver)))
         }
+    }
 
-        todo!()
+    fn string_index(&self, s: &str) -> Option<u16> {
+        self.constant_pool.iter().position(|c| matches!(c.as_string(), Ok(k) if k == s)).map(|pos| pos as u16)
     }
 
     fn show(&self, v: &Value) -> String {
-        match v {
-            Value::Int(n) => n.to_string(),
-            Value::Bool(b) => b.to_string(),
-            &Value::Reference(addr) => self.show(&self.get(addr as usize).unwrap()),
-            Value::Array(arr) => format!("[{}]", arr
-                .iter()
-                .map(|&addr| self.show(&self.get(addr as usize).unwrap()))
-                .collect_vec()
-                .join(", ")
-            ),
-            Value::Object { parent, fields, methods } => format!(
-                "object({})",
-                (match self.get(*parent as usize).unwrap() {
-                    Value::Null => None,
-                    obj => Some(format!("..={}", self.show(&obj))),
-                }).into_iter().chain(fields
+        fn go(this: &Interpreter, depth: u8, v: &Value) -> String {
+            if depth > 3 {
+                return "[deep!]".to_string();
+            }
+
+            match v {
+                Value::Int(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                &Value::Reference(addr) => go(this, depth + 1, &this.get(addr as usize).unwrap()),
+                Value::Array(arr) => format!("[{}]", arr
                     .iter()
-                    .map(|(k, v)| format!("{}={}", k, self.show(&self.get(*v as usize).unwrap())))
-                )
-                .collect_vec()
-                .join(", ")
-            ),
-            Value::Null => "null".to_string(),
+                    .map(|&addr| go(this, depth + 1, &this.get(addr as usize).unwrap()))
+                    .collect_vec()
+                    .join(", ")
+                ),
+                Value::Object { parent, fields, methods } => format!(
+                    "object({})",
+                    (match this.get(*parent as usize).unwrap() {
+                        Value::Null => None,
+                        obj => Some(format!("..={}", go(this, depth + 1, &obj))),
+                    }).into_iter().chain({
+                        let mut fs = fields.iter().map(|(k, v)| format!(
+                            "{}={}",
+                            this.constant_pool[*k as usize].as_string().unwrap(),
+                            go(this, depth + 1, &this.get(*v as usize).unwrap())
+                        )).collect_vec();
+                        fs.sort();
+                        fs
+                    })
+                    .collect_vec()
+                    .join(", ")
+                ),
+                Value::Null => "null".to_string(),
+            }
         }
+
+        go(self, 0, v)
     }
 
     fn call_builtin_method(&self, receiver: Value, name: &str, arg: Value) -> Result<Value> {
@@ -408,6 +433,33 @@ impl Interpreter {
 
     fn addr_of_local(&mut self, i: u16) -> Result<&mut usize> {
         self.frame().locals.get_mut(i as usize).ok_or_else(|| anyhow!("index {} out of range", i))
+    }
+
+    fn get_field(&mut self, obj: &Value, name: &str) -> Result<&mut [u8/*; 8*/]> {
+        use Value::*;
+        // FIXME avoid cloning
+        match self.deref(obj.clone()).unwrap() {
+            (addr, Object { parent, fields, methods }) => {
+                let name_index = self.string_index(name).ok_or_else(||
+                    anyhow!("the field {} is literally nowhere to be found. It's definitely not in {}, either.", name, self.show(obj))
+                )?;
+
+                let index = fields.binary_search_by_key(&name_index, |p| p.0)
+                    // TODO tail-recurse for parent
+                    .map_err(|_| anyhow!("no such field {}", name))?;
+
+                let field_value_addr = addr as usize
+                    + 1  // tag
+                    + 24 // parent, field and method counts
+                    + index as usize * 10 // field index
+                    + 2; // skip key
+                Ok(self.heap[field_value_addr .. field_value_addr + 8].as_mut())
+            },
+            _ => Err(anyhow!(
+                "cannot access field {} of {}. In fact, it doesn't even matter
+                what the field's name is, as {} is not an object.", name, self.show(obj), self.show(obj)
+            )),
+        }
     }
 
     fn print(&mut self, format: &str, args: &[Value]) -> Result<Value> {
@@ -490,6 +542,7 @@ fn run(this: &mut Interpreter) -> Result<Value> {
         let mut increment = true;
         match this.code[this.pc].clone() {
             Instr::Literal(i) => {
+                // replace with a specialised instruction
                 increment = false;
                 this.code[this.pc] = match this.constant_pool[i as usize] {
                     Constant::Null => Ok(Instr::LiteralNull),
@@ -527,7 +580,10 @@ fn run(this: &mut Interpreter) -> Result<Value> {
             },
             Instr::GetLocal(i) => {
                 let addr = *this.addr_of_local(i)?;
-                this.push(this.get(addr)?)?;
+                this.push(match this.get(addr)? {
+                    Value::Array(_) | Value::Object { .. } => Value::Reference(addr as u64),
+                    v => v,
+                })?;
                 Ok(())
             },
             Instr::SetLocal(i) => {
@@ -557,6 +613,36 @@ fn run(this: &mut Interpreter) -> Result<Value> {
                 let v = this.peek()?;
                 let addr = this.alloc(&v)?;
                 this.global_map.insert(name, Left(addr));
+                Ok(())
+            },
+            Instr::GetField(i) => {
+                // replace with a direct get
+                increment = false;
+                let name = this.constant_pool[i as usize].as_string()?;
+                this.code[this.pc] = Instr::GetFieldDirect(name);
+                Ok(())
+            },
+            Instr::GetFieldDirect(name) => {
+                let obj = this.pop()?;
+                let ref_bytes = this.get_field(&obj, name.as_str())?;
+                let addr = u64::from_le_bytes(ref_bytes.try_into().unwrap()) as usize;
+                this.push(this.get(addr)?)?;
+                Ok(())
+            },
+            Instr::SetField(i) => {
+                // replace with a direct set
+                increment = false;
+                let name = this.constant_pool[i as usize].as_string()?;
+                this.code[this.pc] = Instr::SetFieldDirect(name);
+                Ok(())
+            },
+            Instr::SetFieldDirect(name) => {
+                let v = this.pop()?;
+                let obj = this.pop()?;
+                let v_addr = this.alloc(&v)?;
+                let ref_bytes = this.get_field(&obj, name.as_str())?;
+                ref_bytes.copy_from_slice(v_addr.to_le_bytes().as_slice());
+                this.push(v)?;
                 Ok(())
             },
             Instr::Label(_) => unreachable!("labels should be removed by the label collection pass"),
@@ -642,6 +728,7 @@ fn run(this: &mut Interpreter) -> Result<Value> {
                 this.push(Value::Reference(arr_addr as u64))
             },
             Instr::Object(class) => {
+                // FIXME do this all in a single loop
                 let mut members = this.constant_pool[class as usize].as_class()?
                     .into_iter()
                     .map(|i| (i, this.constant_pool[i as usize].clone()))
@@ -660,30 +747,30 @@ fn run(this: &mut Interpreter) -> Result<Value> {
                 for (method_index, slot) in members.into_iter() {
                     match slot {
                         Constant::Slot(i) => {
-                            let name = this.constant_pool[i as usize].as_string()?;
                             let v = this.pop()?;
                             let addr = this.alloc(&v)?;
-                            fields.push((name, addr as u64));
+                            fields.push((i, addr as u64));
                         },
                         Constant::Method { name_idx, .. } => {
-                            let name = this.constant_pool[name_idx as usize].as_string()?;
-                            methods.push((name, method_index as u16))
+                            methods.push((name_idx, method_index as u16))
                         },
                         _ => unreachable!(),
                     }
                 }
 
-                fields.reverse();
+                fields.sort_by_key(|p| p.0);
 
                 // FIXME this is one of the places with the stack value / heap object distinction
                 let parent = this.pop()?;
                 let parent = this.alloc(&parent)? as u64;
-
-                this.push(Value::Object {
+                let obj = Value::Object {
                     parent,
                     fields,
                     methods: methods.into_iter().collect(),
-                })
+                };
+
+                let addr = this.alloc(&obj)? as u64;
+                this.push(Value::Reference(addr))
             },
         }?;
 
@@ -710,8 +797,8 @@ fn main() -> Result<()> {
             eprintln!(
                 "interpreter crash:\n\
                 call_stack = {call_stack:#?}\n\
-                code = {code:#?}\n\
-                constant_pool = {constant_pool:#?}\n\
+                code = {code:?}\n\
+                constant_pool = {constant_pool:?}\n\
                 global_map = {global_map:#?}\n\
                 label_map = {label_map:#?}\n\
                 pc = {pc:#?}\n\
