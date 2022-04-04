@@ -338,7 +338,7 @@ impl Interpreter {
                         allocated_args.into_iter().chain(std::iter::once(receiver_addr as usize))
                     ).collect_vec())
                 },
-                None => todo!(),
+                None => self.call_method(self.get(parent as usize)?, name, args),
             }
         } else {
             Err(anyhow!("cannot call method on {}", self.show(&receiver)))
@@ -351,7 +351,7 @@ impl Interpreter {
 
     fn show(&self, v: &Value) -> String {
         fn go(this: &Interpreter, depth: u8, v: &Value) -> String {
-            if depth > 3 {
+            if depth > 10 {
                 return "[deep!]".to_string();
             }
 
