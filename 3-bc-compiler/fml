@@ -1,0 +1,14 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)"
+
+if [ "$1" = "execute" ]
+then
+    export RUST_BACKTRACE=1
+    "$SCRIPT_DIR/target/release/interpreter" < "$2"
+else
+    echo "Unknown command: $1. Supported commands: execute"
+    exit 1
+fi
