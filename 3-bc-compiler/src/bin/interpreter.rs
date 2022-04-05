@@ -168,7 +168,7 @@ impl Interpreter {
 
         let (pc, init_locals) = match &constant_pool[entry_point] {
             Constant::Method { name_idx: _, n_args: _, n_locals, start, length: _ } => Ok((*start, *n_locals)),
-            _ => Err(anyhow!("Invalid entry point")),
+            k => Err(anyhow!("Invalid entry point {:?}", k)),
         }?;
 
         let mut init = Interpreter {
