@@ -179,6 +179,80 @@ pub fn parse_constant_pool<'a, It: Iterator<Item = &'a u8>>(bc: &mut It) -> Resu
     Ok((constants, code))
 }
 
+pub fn serialise(constant_pool: Vec<Constant>, code: Vec<Instr>) -> Result<Vec<u8>> {
+    let mut buf = vec![];
+    buf.extend((constant_pool.len() as u16).to_le_bytes());
+    for constant in constant_pool {
+        let (tag, payload): (u8, Vec<u8>) = match constant {
+            Constant::Null => (0x01, vec![]),
+            Constant::Boolean(b) => (0x06, vec![if b { 0x01 } else { 0x00 }]),
+            Constant::Integer(i) => (0x00, i.to_le_bytes().into()),
+            Constant::String(s) => {
+                let mut payload: Vec<u8> = (s.bytes().len() as u32).to_le_bytes().into();
+                payload.extend(s.bytes());
+                (0x02, payload)
+            },
+            Constant::Slot(s) => (0x04, s.to_le_bytes().into()),
+            Constant::Class { member_indices } => todo!(),
+            Constant::Method { name_idx, n_args, n_locals, start, length } => {
+                let mut payload: Vec<u8> = name_idx.to_le_bytes().into();
+                payload.extend(n_args.to_le_bytes());
+                payload.extend(n_locals.to_le_bytes());
+                payload.extend((length as u32).to_le_bytes());
+                payload.extend(serialise_code(&code[start..start + length])?);
+                (0x03, payload)
+            },
+        };
+        buf.push(tag);
+        buf.extend(payload);
+    }
+    Ok(buf)
+}
+
+fn instr_to_bcinstr(instr: &Instr) -> BcInstr {
+    match instr {
+        Instr::Literal(k)         => (Opcode::Literal,      Layout::Constant(*k)),
+        Instr::Drop               => (Opcode::Drop,         Layout::Nullary),
+        Instr::Print(k, b)        => (Opcode::Print,        Layout::ConstantAndByte(*k, *b)),
+        Instr::GetLocal(k)        => (Opcode::GetLocal,     Layout::Constant(*k)),
+        Instr::SetLocal(k)        => (Opcode::SetLocal,     Layout::Constant(*k)),
+        Instr::GetGlobal(k)       => (Opcode::GetGlobal,    Layout::Constant(*k)),
+        Instr::SetGlobal(k)       => (Opcode::SetGlobal,    Layout::Constant(*k)),
+        Instr::GetField(k)        => (Opcode::GetField,     Layout::Constant(*k)),
+        Instr::SetField(k)        => (Opcode::SetField,     Layout::Constant(*k)),
+        Instr::Label(k)           => (Opcode::Label,        Layout::Constant(*k)),
+        Instr::Jump(k)            => (Opcode::Jump,         Layout::Constant(*k)),
+        Instr::Branch(k)          => (Opcode::Branch,       Layout::Constant(*k)),
+        Instr::CallMethod(k, b)   => (Opcode::CallMethod,   Layout::ConstantAndByte(*k, *b)),
+        Instr::CallFunction(k, b) => (Opcode::CallFunction, Layout::ConstantAndByte(*k, *b)),
+        Instr::Return             => (Opcode::Return,       Layout::Nullary),
+        Instr::Array              => (Opcode::Array,        Layout::Nullary),
+        Instr::Object(k)          => (Opcode::Object,       Layout::Constant(*k)),
+        Instr::LiteralNull          | Instr::LiteralBool(_)     | Instr::LiteralInt(_)
+        | Instr::GetGlobalDirect(_) | Instr::SetGlobalDirect(_) | Instr::GetFieldDirect(_)
+        | Instr::SetFieldDirect(_)  | Instr::JumpDirect(_)      | Instr::BranchDirect(_)
+        => unreachable!("the extended instruction set doesn't have a bytecode representation"),
+    }
+}
+
+pub fn serialise_code(code: &[Instr]) -> Result<Vec<u8>> {
+    let mut buf = vec![];
+    for instr in code {
+        let (opcode, payload) = instr_to_bcinstr(instr);
+        buf.push(opcode.into());
+        match payload {
+            Layout::Nullary => (),
+            Layout::Constant(k) => buf.extend(k.to_le_bytes()),
+            Layout::ConstantAndByte(k, b) => {
+                buf.extend(k.to_le_bytes());
+                buf.push(b);
+            },
+        }
+    }
+
+    Ok(buf)
+}
+
 pub fn parse_globals<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Result<Vec<u16>> {
     let len = next_u16(iter)?;
     (0..len).map(|_| next_u16(iter)).collect()

@@ -1,7 +1,9 @@
+use std::io::Write;
+
 use anyhow::*;
 
-use fml_bc_interpreter::ast::*;
-use fml_bc_interpreter::bc::*;
+use fml_bc_compiler::ast::*;
+use fml_bc_compiler::bc::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Constant {
@@ -27,6 +29,38 @@ impl Compiler {
         }
     }
 
+    fn assemble(&mut self) -> Result<Vec<u8>> {
+        let main_name = self.fetch_or_add_constant(Constant::String(String::from("main")));
+
+        use fml_bc_compiler::bc::Constant as K;
+        let mut pool: Vec<K> = self.constant_pool.iter().cloned().map(|k| match k {
+            Constant::Null => K::Null,
+            Constant::Boolean(b) => K::Boolean(b),
+            Constant::Integer(i) => K::Integer(i),
+            Constant::String(s) => K::String(s),
+            Constant::Slot(j) => K::Slot(j),
+        }).collect();
+
+        // TODO rework this (for general methods/functions)
+        let main_index = pool.len() as u16;
+        pool.push(K::Method {
+            name_idx: main_name,
+            n_args: 0,
+            n_locals: self.variables.len() as u16,
+            start: 0,
+            length: self.code.len()
+        });
+
+        let mut buf = vec![];
+        buf.extend(serialise(pool, self.code.clone())?);
+        // TODO: globals
+        buf.extend(0_u16.to_le_bytes());
+        // entry point
+        buf.extend(main_index.to_le_bytes());
+
+        Ok(buf)
+    }
+
     fn fetch_or_add_constant(&mut self, k: Constant) -> u16 {
         self.constant_pool.iter().position(|c| c == &k).unwrap_or_else(|| {
             self.constant_pool.push(k);
@@ -34,7 +68,7 @@ impl Compiler {
         }) as u16
     }
 
-    fn add_variable(&mut self, name: String) -> u16 {
+    fn introduce_variable(&mut self, name: String) -> u16 {
         self.variables.push(name);
         self.variables.len() as u16 - 1
     }
@@ -64,7 +98,7 @@ impl Compiler {
                 let k = self.fetch_or_add_constant(Constant::String(name.0.clone()));
                 self.emit(Literal(k))?;
                 self.compile(value)?;
-                let var = self.add_variable(name.0.clone());
+                let var = self.introduce_variable(name.0.clone());
                 self.emit(SetLocal(var))?;
             },
             AST::Array { size, value } => todo!(),
@@ -119,6 +153,12 @@ fn main() -> Result<()> {
     let ast = serde_json::from_reader(std::io::stdin())?;
     let mut c = Compiler::new();
     c.compile(&ast)?;
-    println!("{:?}", c.code);
+    let buf = c.assemble()?;
+    let amount = std::io::stdout().write(&buf)?;
+
+    if amount != buf.len() {
+        panic!("could not write all bytes");
+    }
+
     Ok(())
 }

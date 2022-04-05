@@ -1,7 +1,7 @@
 #![feature(fn_traits, associated_type_defaults)]
 
 use std::{collections::BTreeMap, fmt::Display};
-use fml_bc_interpreter::util::BooleanAssertions;
+use fml_bc_compiler::util::BooleanAssertions;
 use itertools::Itertools;
 use itertools::Either;
 use itertools::Either::{Left, Right};
@@ -9,7 +9,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use tailcall::tailcall;
 
-use fml_bc_interpreter::*;
+use fml_bc_compiler::*;
 use bc::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
