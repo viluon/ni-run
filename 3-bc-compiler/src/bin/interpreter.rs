@@ -135,6 +135,9 @@ const STACK_LIMIT: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StackFrame {
+    // for a method, this is start + length
+    // used to check if we're past the local code vector
+    code_end: Pc,
     locals: Vec<usize>,
     return_address: Pc,
 }
@@ -166,8 +169,9 @@ impl Interpreter {
         let (code, label_map) =
             bc::collect_labels(&mut constant_pool, code)?;
 
-        let (pc, init_locals) = match &constant_pool[entry_point] {
-            Constant::Method { name_idx: _, n_args: _, n_locals, start, length: _ } => Ok((*start, *n_locals)),
+        let (pc, length, init_locals) = match &constant_pool[entry_point] {
+            Constant::Method { name_idx: _, n_args: _, n_locals, start, length } =>
+                Ok((*start, *length, *n_locals)),
             k => Err(anyhow!("Invalid entry point {:?}", k)),
         }?;
 
@@ -184,6 +188,7 @@ impl Interpreter {
         };
 
         let bottom_frame = StackFrame {
+            code_end: pc + length,
             locals: (0..init_locals).map(|_| init.alloc(&Value::Null)).collect::<Result<_>>()?,
             return_address: 0,
         };
@@ -264,6 +269,19 @@ impl Interpreter {
         run(self)
     }
 
+    fn perform_return(&mut self) -> Result<()> {
+        let StackFrame {
+            code_end: _,
+            return_address,
+            locals: _,
+        } = self.call_stack.pop().unwrap();
+        (!self.call_stack.is_empty()).expect(||
+            anyhow!("popped the global frame")
+        )?;
+        self.pc = return_address;
+        Ok(())
+    }
+
     fn array_index(&self, arr: usize, i: u32) -> Result<usize> {
         let i = i as usize;
         let v = self.get(arr)?;
@@ -327,14 +345,14 @@ impl Interpreter {
         } else if let Ok((receiver_addr, Value::Object { parent, methods, fields: _ })) = self.deref(receiver.clone()) {
             match methods.get(&self.string_index(name.as_str()).unwrap()) {
                 Some(&i) => {
-                    let (_name, n_args, n_locals, start, _len) = self.constant_pool[i as usize].as_method()?;
+                    let (_name, n_args, n_locals, start, len) = self.constant_pool[i as usize].as_method()?;
                     (n_args as usize == args.len() + 1).expect(||
                         anyhow!("wrong number of arguments, {} expects {}, not {}", name, n_args, args.len())
                     )?;
                     let allocated_args = args.iter().map(|v| self.alloc(v)).collect::<Result<Vec<_>>>()?;
                     // FIXME not in the spec?
                     self.push(Value::Reference(receiver_addr))?;
-                    self.call_function(start, n_locals, &(
+                    self.call_function(start, start + len, n_locals, &(
                         allocated_args.into_iter().chain(std::iter::once(receiver_addr as usize))
                     ).collect_vec())
                 },
@@ -421,9 +439,10 @@ impl Interpreter {
         }
     }
 
-    fn call_function(&mut self, start: Pc, n_locals: u16, args: &[usize]) -> Result<()> {
+    fn call_function(&mut self, start: Pc, end: Pc, n_locals: u16, args: &[usize]) -> Result<()> {
         let null_ptr = self.alloc(&Value::Null)?;
         self.call_stack.push(StackFrame {
+            code_end: end,
             return_address: self.pc + 1,
             locals: args.iter().rev().chain((0..n_locals).map(|_| &null_ptr)).copied().collect(),
         });
@@ -517,10 +536,12 @@ impl Interpreter {
 }
 
 fn run(this: &mut Interpreter) -> Result<Value> {
-    loop {
-        if this.pc >= this.code.len() {
-            return Ok(Value::Null)
-            // return Err(anyhow!("program counter out of bounds"))
+    'outer: loop {
+        while matches!(this.call_stack.last().unwrap(), StackFrame { code_end, .. } if this.pc >= *code_end) {
+            if this.call_stack.len() == 1 {
+                break 'outer
+            }
+            this.perform_return()?;
         }
 
         #[cfg(debug_assertions)]
@@ -686,10 +707,12 @@ fn run(this: &mut Interpreter) -> Result<Value> {
             Instr::CallFunction(i, n_args) => {
                 increment = false;
                 let global_name = this.constant_pool[i as usize].as_string()?;
-                let fn_addr = this.global_map[&global_name].right()
+                let fn_addr = this.global_map.get(&global_name)
+                    .ok_or_else(|| anyhow!("compiler bug: global {} not found", global_name))?
+                    .right()
                     .ok_or_else(|| anyhow!("attempt to call variable {}", global_name))?;
 
-                let (_, arity, n_locals, start, _) = this.constant_pool[fn_addr as usize].as_method()?;
+                let (_, arity, n_locals, start, len) = this.constant_pool[fn_addr as usize].as_method()?;
                 (arity == n_args).expect(||
                     anyhow!("arity mismatch, expected {} arguments, got {}", arity, n_args)
                 )?;
@@ -698,21 +721,12 @@ fn run(this: &mut Interpreter) -> Result<Value> {
                     .map(|_| this.pop().and_then(|arg| this.alloc(&arg)))
                     .collect::<Result<Vec<_>>>()?;
 
-                this.call_function(start, n_locals, &args)?;
+                this.call_function(start, start + len, n_locals, &args)?;
                 Ok(())
             },
             Instr::Return => {
                 increment = false;
-                let StackFrame {
-                    return_address,
-                    locals: _,
-                } = this.call_stack.pop().unwrap();
-                (!this.call_stack.is_empty()).expect(||
-                    anyhow!("popped the global frame")
-                )?;
-
-                this.pc = return_address;
-                Ok(())
+                this.perform_return()
             },
             Instr::Array => {
                 let initial = this.pop()?;
@@ -775,7 +789,9 @@ fn run(this: &mut Interpreter) -> Result<Value> {
         }?;
 
         this.pc += increment as usize;
-    }
+    };
+    Ok(Value::Null)
+    // Err(anyhow!("nope"))
 }
 
 fn main() -> Result<()> {
