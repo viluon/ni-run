@@ -17,21 +17,27 @@ enum Constant {
     String(String),
     Slot(u16),
     Method { name_idx: u16, n_locals: u16, n_args: u8, code: Vec<Instr> },
+    Class(Vec<u16>),
 }
 
-#[derive(Debug)]
-struct Prototype(
-    String,
-    Vec<String>,
-    Box<AST>,
-);
+#[derive(Debug, Clone)]
+struct Prototype {
+    is_method: bool, // true if the prototype is a method (takes a receiver)
+    k: u16, // index into the constant pool
+         // at which the method will be stored
+         // after compilation
+    name: String,
+    params: Vec<String>,
+    body: Box<AST>,
+}
 
 struct Compiler {
-    function_name: String,
+    current_proto: Prototype,
     constant_pool: Vec<Constant>,
     entry_point: Option<u16>,
     functions: VecDeque<Prototype>,
     n_locals: u16,
+    n_labels: u16,
     scopes: Vec<BTreeMap<String, u16>>,
     code: Vec<Instr>,
 }
@@ -39,29 +45,52 @@ struct Compiler {
 impl Compiler {
     fn new() -> Compiler {
         Compiler {
-            function_name: "main".to_string(),
+            current_proto: Prototype {
+                is_method: false,
+                k: 0,
+                name: String::new(),
+                params: vec![],
+                body: Box::new(AST::Null)
+            },
             constant_pool: vec![],
             entry_point: None,
             functions: Default::default(),
             n_locals: 0,
+            n_labels: 0,
             scopes: vec![],
             code: vec![],
         }
     }
 
+    fn schedule_function(&mut self, name: String, params: Vec<String>, body: AST) -> u16 {
+        self.schedule_prototype(name, params, body, false)
+    }
+
+    fn schedule_method(&mut self, name: String, params: Vec<String>, body: AST) -> u16 {
+        self.schedule_prototype(name, params, body, true)
+    }
+
+    fn schedule_prototype(&mut self, name: String, params: Vec<String>, body: AST, is_method: bool) -> u16 {
+        let k = self.constant_pool.len() as u16;
+        // bogus values to avoid deduplication choosing this index
+        self.constant_pool.push(Constant::Method { name_idx: u16::MAX, n_locals: u16::MAX, n_args: u8::MAX, code: vec![] });
+        self.functions.push_back(Prototype { is_method, k, name, params, body: Box::new(body) });
+        k
+    }
+
     fn finalise_function(&mut self, n_args: u8) -> Result<u16> {
-        let name_idx = self.fetch_or_add_constant(Constant::String(self.function_name.clone()));
-        let method_idx = self.constant_pool.len() as u16;
-        self.constant_pool.push(Constant::Method {
+        let name_idx = self.fetch_or_add_constant(Constant::String(self.current_proto.name.clone()));
+        let pos = self.current_proto.k;
+        self.constant_pool[pos as usize] = Constant::Method {
             name_idx,
             n_args,
             n_locals: self.n_locals,
             code: self.code.drain(..).collect(),
-        });
-        self.scopes[0].insert(self.function_name.clone(), method_idx);
+        };
+        self.scopes[0].insert(self.current_proto.name.clone(), pos);
 
         self.n_locals = 0;
-        Ok(self.constant_pool.len() as u16 - 1)
+        Ok(pos)
     }
 
     fn assemble(mut self) -> Result<Vec<u8>> {
@@ -86,6 +115,7 @@ impl Compiler {
                         name_idx, n_args, n_locals, start, length,
                     }
                 },
+                Constant::Class(member_indices) => K::Class { member_indices },
             })
         }
 
@@ -172,7 +202,30 @@ impl Compiler {
                 }
             },
             AST::Array { size, value } => todo!(),
-            AST::Object { extends, members } => todo!(),
+            AST::Object { extends, members } => {
+                self.compile_node(extends)?;
+                let mut fields = vec![];
+                for member in members {
+                    match member {
+                        AST::Variable { name, value } => {
+                            self.compile_node(value)?;
+                            let name_str = self.fetch_or_add_constant(Constant::String(name.0.clone()));
+                            // add a slot
+                            fields.push(self.fetch_or_add_constant(Constant::Slot(name_str)));
+                        },
+                        AST::Function { name, parameters, body } => {
+                            fields.push(self.schedule_method(
+                                name.0.clone(),
+                                parameters.iter().map(|p| p.0.clone()).collect(),
+                                *body.clone(),
+                            ));
+                        },
+                        _ => return Err(anyhow!("unexpected node in object: {:?}", member)),
+                    }
+                }
+                let class = self.fetch_or_add_constant(Constant::Class(fields));
+                self.emit(Object(class))?;
+            },
             AST::AccessVariable { name } => {
                 let instr = self.find_variable(&name.0)
                     .map(|v| match v {
@@ -184,7 +237,11 @@ impl Compiler {
                     });
                 self.emit(instr)?;
             },
-            AST::AccessField { object, field } => todo!(),
+            AST::AccessField { object, field } => {
+                self.compile_node(object)?;
+                let field_str = self.fetch_or_add_constant(Constant::String(field.0.clone()));
+                self.emit(GetField(field_str))?;
+            },
             AST::AccessArray { array, index } => todo!(),
             AST::AssignVariable { name, value } => {
                 self.compile_node(value)?;
@@ -198,14 +255,20 @@ impl Compiler {
                     });
                 self.emit(instr)?;
             },
-            AST::AssignField { object, field, value } => todo!(),
+            AST::AssignField { object, field, value } => {
+                self.compile_node(object)?;
+                self.compile_node(value)?;
+                let field_str = self.fetch_or_add_constant(Constant::String(field.0.clone()));
+                self.emit(SetField(field_str))?;
+            },
             AST::AssignArray { array, index, value } => todo!(),
-            AST::Function { name, parameters, body } =>
-                self.functions.push_back(Prototype(
+            AST::Function { name, parameters, body } => {
+                self.schedule_function(
                     name.0.clone(),
                     parameters.iter().map(|p| p.0.clone()).collect(),
-                    body.clone(),
-                )),
+                    *body.clone(),
+                );
+            },
             AST::CallFunction { name, arguments } => {
                 let k = self.fetch_or_add_constant(Constant::String(name.0.clone()));
                 for arg in arguments {
@@ -213,7 +276,14 @@ impl Compiler {
                 }
                 self.emit(CallFunction(k, arguments.len() as u8))?;
             },
-            AST::CallMethod { object, name, arguments } => todo!(),
+            AST::CallMethod { object, name, arguments } => {
+                self.compile_node(object)?;
+                let k = self.fetch_or_add_constant(Constant::String(name.0.clone()));
+                for arg in arguments {
+                    self.compile_node(arg)?;
+                }
+                self.emit(CallMethod(k, arguments.len() as u8 + 1))?;
+            },
             AST::Top(stmts) => {
                 // TODO maybe we need something more here?
                 for stmt in stmts {
@@ -230,8 +300,29 @@ impl Compiler {
                 }
                 self.scopes.pop();
             },
-            AST::Loop { condition, body } => todo!(),
-            AST::Conditional { condition, consequent, alternative } => todo!(),
+            AST::Loop { condition, body } => {
+                let cond_lbl = self.new_label("loop:cond");
+                let body_lbl = self.new_label("loop:body");
+                self.emit(Jump(cond_lbl))?;
+                self.emit(Label(body_lbl))?;
+                self.compile_node(body)?;
+                self.emit(Label(cond_lbl))?;
+                self.compile_node(condition)?;
+                self.emit(Branch(body_lbl))?;
+            },
+            AST::Conditional { condition, consequent, alternative } => {
+                let con_lbl = self.new_label("cond:con");
+                let alt_lbl = self.new_label("cond:alt");
+                let end_lbl = self.new_label("cond:end");
+                self.compile_node(condition)?;
+                self.emit(Branch(con_lbl))?;
+                self.emit(Label(alt_lbl))?;
+                self.compile_node(alternative)?;
+                self.emit(Jump(end_lbl))?;
+                self.emit(Label(con_lbl))?;
+                self.compile_node(consequent)?;
+                self.emit(Label(end_lbl))?;
+            },
             AST::Print { format, arguments } => {
                 let k = self.fetch_or_add_constant(Constant::String(format.clone()));
                 for arg in arguments {
@@ -245,33 +336,43 @@ impl Compiler {
     }
 
     fn compile(&mut self, program: &AST) -> Result<()> {
-        self.functions.push_back(Prototype(
+        self.schedule_function(
             "main".to_string(),
             vec![],
-            Box::new(program.clone()),
-        ));
+            program.clone(),
+        );
 
-        while let Some(
-            Prototype(name, params, body)
-        ) = self.functions.pop_front() {
-            let n_args = params.len() as u8;
-            self.function_name = name;
+        while let Some(ref proto@Prototype {
+            is_method,
+            k,
+            ref name,
+            ref params,
+            ref body
+        }) = self.functions.pop_front() {
+            self.current_proto = proto.clone();
             if self.scopes.len() > 1 {
                 self.scopes.drain(1..);
             }
             // add a new scope and add all parameters to it
             self.scopes.push(Default::default());
-            for p in params.into_iter() {
+            for p in params.iter() {
                 self.introduce_local(p.clone()).map_err(|_| anyhow!("could not introduce {}", p.clone()))?;
             }
 
-            self.compile_node(&body)?;
+            self.compile_node(body)?;
+            let n_args = params.len() as u8 + is_method as u8;
             let pos = self.finalise_function(n_args)?;
             // the first compiled function is the entry point
             self.entry_point.get_or_insert(pos);
         }
 
         Ok(())
+    }
+
+    fn new_label(&mut self, name_hint: &str) -> u16 {
+        let name = format!("{}:{}:{}", self.n_labels, self.current_proto.name, name_hint);
+        self.n_labels += 1;
+        self.fetch_or_add_constant(Constant::String(name))
     }
 }
 

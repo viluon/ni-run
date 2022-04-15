@@ -316,7 +316,14 @@ impl Interpreter {
 
     fn call_method(&mut self, receiver: Value, name: String, args: &[Value]) -> Result<()> {
         if matches!(receiver, Value::Array(_) | Value::Int(_) | Value::Bool(_) | Value::Null) {
-            // TODO check arity
+            (args.len() == 1).expect(|| anyhow!(
+                "attempt to call {} on {} failed: \
+                primitive receivers only support methods \
+                of one argument, not {}",
+                name,
+                self.show(&receiver),
+                args.len()
+            ))?;
             self.push(self.call_builtin_method(receiver, name.as_str(), args[0].clone())?)?;
             Ok(())
         } else if let Ok((array_addr, Value::Array(arr))) = self.deref(receiver.clone()) {
@@ -346,9 +353,9 @@ impl Interpreter {
             match methods.get(&self.string_index(name.as_str()).unwrap()) {
                 Some(&i) => {
                     let (_name, n_args, n_locals, start, len) = self.constant_pool[i as usize].as_method()?;
-                    (n_args as usize == args.len() + 1).expect(||
-                        anyhow!("wrong number of arguments, {} expects {}, not {}", name, n_args, args.len())
-                    )?;
+                    (n_args as usize == args.len() + 1).expect(|| anyhow!(
+                        "wrong number of arguments, {} expects {}, not {} (receiver and {:?})", name, n_args, args.len() + 1, args
+                    ))?;
                     let allocated_args = args.iter().map(|v| self.alloc(v)).collect::<Result<Vec<_>>>()?;
                     // FIXME not in the spec?
                     self.push(Value::Reference(receiver_addr))?;
@@ -457,7 +464,7 @@ impl Interpreter {
     fn get_field(&mut self, obj: &Value, name: &str) -> Result<&mut [u8/*; 8*/]> {
         use Value::*;
         // FIXME avoid cloning
-        match self.deref(obj.clone()).unwrap() {
+        match self.deref(obj.clone())? {
             (addr, Object { parent, fields, methods }) => {
                 let name_index = self.string_index(name).ok_or_else(||
                     anyhow!("the field {} is literally nowhere to be found. It's definitely not in {}, either.", name, self.show(obj))

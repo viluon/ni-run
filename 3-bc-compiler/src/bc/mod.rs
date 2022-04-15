@@ -193,7 +193,11 @@ pub fn serialise(constant_pool: Vec<Constant>, code: Vec<Instr>) -> Result<Vec<u
                 (0x02, payload)
             },
             Constant::Slot(s) => (0x04, s.to_le_bytes().into()),
-            Constant::Class { member_indices } => todo!(),
+            Constant::Class { member_indices } => (0x05, {
+                (member_indices.len() as u16).to_le_bytes().into_iter().chain(
+                    member_indices.into_iter().flat_map(u16::to_le_bytes)
+                ).collect()
+            }),
             Constant::Method { name_idx, n_args, n_locals, start, length } => {
                 let mut payload: Vec<u8> = name_idx.to_le_bytes().into();
                 payload.extend(n_args.to_le_bytes());
