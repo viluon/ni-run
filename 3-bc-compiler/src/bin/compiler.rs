@@ -38,6 +38,7 @@ struct Compiler {
     functions: VecDeque<Prototype>,
     n_locals: u16,
     n_labels: u16,
+    fresh_counter: u16,
     scopes: Vec<BTreeMap<String, u16>>,
     code: Vec<Instr>,
 }
@@ -57,7 +58,8 @@ impl Compiler {
             functions: Default::default(),
             n_locals: 0,
             n_labels: 0,
-            scopes: vec![],
+            fresh_counter: 0,
+            scopes: vec![Default::default()],
             code: vec![],
         }
     }
@@ -193,7 +195,7 @@ impl Compiler {
             },
             AST::Variable { name, value } => {
                 self.compile_node(value)?;
-                if self.scopes.len() == 1 {
+                if self.scopes.len() <= 2 {
                     let var = self.get_or_introduce_global(name.0.clone());
                     self.emit(SetGlobal(var))?;
                 } else {
@@ -201,7 +203,25 @@ impl Compiler {
                     self.emit(SetLocal(var))?;
                 }
             },
-            AST::Array { size: _, value: _ } => todo!(),
+            AST::Array { size, value } => {
+                let null = Literal(self.fetch_or_add_constant(Constant::Null));
+                let (array_len, arr) = {
+                    let array_len_name = self.fresh("array_length");
+                    let array_len = self.introduce_local(array_len_name)?;
+                    let arr_name = self.fresh("array");
+                    let arr = self.introduce_local(arr_name)?;
+                    (array_len, arr)
+                };
+                self.compile_node(size)?;
+                self.emit(SetLocal(array_len))?;
+                self.emit(null)?;
+                self.emit(Array)?;
+                self.emit(SetLocal(arr))?;
+                if let AST::Null = **value {
+                } else {
+                    self.compile_array_init(value, array_len, arr)?;
+                }
+            },
             AST::Object { extends, members } => {
                 self.compile_node(extends)?;
                 let mut fields = vec![];
@@ -242,7 +262,12 @@ impl Compiler {
                 let field_str = self.fetch_or_add_constant(Constant::String(field.0.clone()));
                 self.emit(GetField(field_str))?;
             },
-            AST::AccessArray { array: _, index: _ } => todo!(),
+            AST::AccessArray { array, index } => {
+                self.compile_node(array)?;
+                self.compile_node(index)?;
+                let get = self.fetch_or_add_constant(Constant::String("get".to_string()));
+                self.emit(CallMethod(get, 2))?;
+            },
             AST::AssignVariable { name, value } => {
                 self.compile_node(value)?;
                 let instr = self.find_variable(&name.0)
@@ -261,7 +286,13 @@ impl Compiler {
                 let field_str = self.fetch_or_add_constant(Constant::String(field.0.clone()));
                 self.emit(SetField(field_str))?;
             },
-            AST::AssignArray { array: _, index: _, value: _ } => todo!(),
+            AST::AssignArray { array, index, value } => {
+                self.compile_node(array)?;
+                self.compile_node(value)?;
+                self.compile_node(index)?;
+                let set = self.fetch_or_add_constant(Constant::String("set".to_string()));
+                self.emit(CallMethod(set, 3))?;
+            },
             AST::Function { name, parameters, body } => {
                 self.schedule_function(
                     name.0.clone(),
@@ -335,6 +366,48 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_array_init(&mut self, value: &AST, array_len: u16, arr: u16) -> Result<()> {
+        use Instr::*;
+        let arr_i = {
+            let arr_i_name = self.fresh("array_index");
+            self.introduce_local(arr_i_name)?
+        };
+
+        let start = self.new_label("array_init:start");
+        let cond = self.new_label("array_init:cond");
+        let set = self.fetch_or_add_constant(Constant::String("set".to_string()));
+        let add = self.fetch_or_add_constant(Constant::String("+".to_string()));
+        let lt = self.fetch_or_add_constant(Constant::String("<".to_string()));
+        let zero = Literal(self.fetch_or_add_constant(Constant::Integer(0)));
+        let one = Literal(self.fetch_or_add_constant(Constant::Integer(1)));
+
+        self.emit(zero)?;
+        self.emit(SetLocal(arr_i))?;
+        self.emit(Jump(cond))?;
+        self.emit(Label(start))?;
+        {
+            self.emit(GetLocal(arr))?;
+            self.compile_node(value)?;
+            // call the set method on the local array
+            self.emit(GetLocal(arr_i))?;
+            self.emit(CallMethod(set, 3))?;
+            self.emit(GetLocal(arr_i))?;
+            self.emit(one)?;
+            self.emit(CallMethod(add, 2))?;
+            self.emit(SetLocal(arr_i))?;
+        }
+        self.emit(Label(cond))?;
+        {
+            // compare to the length of the array
+            // self.emit(GetLocal(arr_i))?; // implicit, since both predecessor basic blocks leave it on the stack
+            self.emit(GetLocal(array_len))?;
+            self.emit(CallMethod(lt, 2))?;
+            self.emit(Branch(start))?;
+        }
+        self.emit(GetLocal(arr))?;
+        Ok(())
+    }
+
     fn compile(&mut self, program: &AST) -> Result<()> {
         self.schedule_function(
             "main".to_string(),
@@ -379,6 +452,12 @@ impl Compiler {
         self.n_labels += 1;
         self.fetch_or_add_constant(Constant::String(name))
     }
+
+    fn fresh(&mut self, name_hint: &str) -> String {
+        let name = format!("{}:{}:{}", self.fresh_counter, self.current_proto.name, name_hint);
+        self.fresh_counter += 1;
+        name
+    }
 }
 
 fn main() -> Result<()> {
@@ -386,11 +465,7 @@ fn main() -> Result<()> {
     let mut c = Compiler::new();
     c.compile(&ast)?;
     let buf = c.assemble()?;
-    let amount = std::io::stdout().write(&buf)?;
-
-    if amount != buf.len() {
-        panic!("could not write all bytes");
-    }
+    std::io::stdout().write_all(&buf)?;
 
     Ok(())
 }

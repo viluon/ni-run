@@ -293,7 +293,7 @@ impl Interpreter {
      * @warn Handles PC manipulation.
      */
     fn call_method(&mut self, receiver: Value, name: String, args: &[Value]) -> Result<()> {
-        if matches!(receiver, Value::Array(_) | Value::Int(_) | Value::Bool(_) | Value::Null) {
+        if matches!(receiver, Value::Int(_) | Value::Bool(_) | Value::Null) {
             (args.len() == 1).expect(|| anyhow!(
                 "attempt to call {} on {} failed: \
                 primitive receivers only support methods \
