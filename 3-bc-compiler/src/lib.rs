@@ -7,5 +7,4 @@ extern crate quickcheck_macros;
 
 pub mod ast;
 pub mod bc;
-pub mod state;
 pub mod util;

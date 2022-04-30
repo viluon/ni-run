@@ -201,7 +201,7 @@ impl Compiler {
                     self.emit(SetLocal(var))?;
                 }
             },
-            AST::Array { size, value } => todo!(),
+            AST::Array { size: _, value: _ } => todo!(),
             AST::Object { extends, members } => {
                 self.compile_node(extends)?;
                 let mut fields = vec![];
@@ -242,7 +242,7 @@ impl Compiler {
                 let field_str = self.fetch_or_add_constant(Constant::String(field.0.clone()));
                 self.emit(GetField(field_str))?;
             },
-            AST::AccessArray { array, index } => todo!(),
+            AST::AccessArray { array: _, index: _ } => todo!(),
             AST::AssignVariable { name, value } => {
                 self.compile_node(value)?;
                 let instr = self.find_variable(&name.0)
@@ -261,7 +261,7 @@ impl Compiler {
                 let field_str = self.fetch_or_add_constant(Constant::String(field.0.clone()));
                 self.emit(SetField(field_str))?;
             },
-            AST::AssignArray { array, index, value } => todo!(),
+            AST::AssignArray { array: _, index: _, value: _ } => todo!(),
             AST::Function { name, parameters, body } => {
                 self.schedule_function(
                     name.0.clone(),
@@ -344,8 +344,8 @@ impl Compiler {
 
         while let Some(ref proto@Prototype {
             is_method,
-            k,
-            ref name,
+            k: _,
+            name: _,
             ref params,
             ref body
         }) = self.functions.pop_front() {
@@ -355,6 +355,11 @@ impl Compiler {
             }
             // add a new scope and add all parameters to it
             self.scopes.push(Default::default());
+
+            if is_method {
+                self.introduce_local("this".into())?;
+            }
+
             for p in params.iter() {
                 self.introduce_local(p.clone()).map_err(|_| anyhow!("could not introduce {}", p.clone()))?;
             }

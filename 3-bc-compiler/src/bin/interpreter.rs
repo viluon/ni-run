@@ -1,13 +1,12 @@
 #![feature(fn_traits, associated_type_defaults)]
 
-use std::{collections::BTreeMap, fmt::Display};
+use std::collections::BTreeMap;
 use fml_bc_compiler::util::BooleanAssertions;
 use itertools::Itertools;
 use itertools::Either;
 use itertools::Either::{Left, Right};
 use anyhow::Result;
 use anyhow::anyhow;
-use tailcall::tailcall;
 
 use fml_bc_compiler::*;
 use bc::*;
@@ -112,20 +111,6 @@ impl Value {
         }
     }
 
-    fn as_array<F: FnOnce(&Value) -> anyhow::Error>(&self, err: F) -> Result<&Vec<u64>> {
-        match self {
-            Value::Array(v) => Ok(v),
-            v => Err(err(v)),
-        }
-    }
-
-    fn as_reference<F: FnOnce(&Value) -> anyhow::Error>(&self, err: F) -> Result<u64> {
-        match self {
-            Value::Reference(addr) => Ok(*addr),
-            v => Err(err(v)),
-        }
-    }
-
     fn is_truthy(&self) -> bool {
         !matches!(self, Value::Bool(false) | Value::Null)
     }
@@ -142,15 +127,13 @@ struct StackFrame {
     return_address: Pc,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default)]
 struct Interpreter {
     constant_pool: Vec<Constant>,
     label_map: BTreeMap<String, Pc>,
     // the keys are both heap addresses and constant pool indices,
     // depending on whether the global is a variable or a function
     global_map: BTreeMap<String, Either<usize, u16>>,
-    // globals vector from bytecode
-    globals: Vec<u16>,
     code: Vec<Instr>,
     stack: Vec<Value>,
     call_stack: Vec<StackFrame>,
@@ -180,7 +163,6 @@ impl Interpreter {
             call_stack: vec![],
             heap: vec![],
             global_map: Default::default(),
-            globals: vec![],
             constant_pool,
             label_map,
             code,
@@ -220,7 +202,7 @@ impl Interpreter {
                 })?;
         }
 
-        Ok(Interpreter { global_map, globals, ..self })
+        Ok(Interpreter { global_map, ..self })
     }
 
     fn alloc(&mut self, v: &Value) -> Result<usize> {
@@ -265,7 +247,7 @@ impl Interpreter {
         self.stack.last().cloned().ok_or_else(|| anyhow!("stack underflow"))
     }
 
-    fn execute(&mut self) -> Result<Value> {
+    fn execute(&mut self) -> Result<()> {
         run(self)
     }
 
@@ -280,14 +262,6 @@ impl Interpreter {
         )?;
         self.pc = return_address;
         Ok(())
-    }
-
-    fn array_index(&self, arr: usize, i: u32) -> Result<usize> {
-        let i = i as usize;
-        let v = self.get(arr)?;
-        let arr = v.as_array(|v| anyhow!("expected an array, got {}", self.show(&v)))?;
-        (i < arr.len()).expect(|| anyhow!("array index out of bounds"))?;
-        Ok(arr[i] as usize)
     }
 
     fn array_set(&mut self, arr: usize, i: u32, el: u64) -> Result<()> {
@@ -314,6 +288,10 @@ impl Interpreter {
         Ok((array_addr.ok_or_else(|| anyhow!("{:?} is not a reference!", v))?, v))
     }
 
+    /**
+     * Call a method.
+     * @warn Handles PC manipulation.
+     */
     fn call_method(&mut self, receiver: Value, name: String, args: &[Value]) -> Result<()> {
         if matches!(receiver, Value::Array(_) | Value::Int(_) | Value::Bool(_) | Value::Null) {
             (args.len() == 1).expect(|| anyhow!(
@@ -325,6 +303,7 @@ impl Interpreter {
                 args.len()
             ))?;
             self.push(self.call_builtin_method(receiver, name.as_str(), args[0].clone())?)?;
+            self.pc += 1;
             Ok(())
         } else if let Ok((array_addr, Value::Array(arr))) = self.deref(receiver.clone()) {
             // TODO check arity
@@ -347,9 +326,12 @@ impl Interpreter {
                 (invalid, _) => return Err(anyhow!(
                     "this is actually the very first time someone thought to call {} on an array.", invalid
                 )),
-            }
+            };
+            self.pc += 1;
             Ok(())
-        } else if let Ok((receiver_addr, Value::Object { parent, methods, fields: _ })) = self.deref(receiver.clone()) {
+        } else if let Ok(
+            (receiver_addr, Value::Object { parent, methods, fields: _ })
+        ) = self.deref(receiver.clone()) {
             match methods.get(&self.string_index(name.as_str()).unwrap()) {
                 Some(&i) => {
                     let (_name, n_args, n_locals, start, len) = self.constant_pool[i as usize].as_method()?;
@@ -358,7 +340,8 @@ impl Interpreter {
                     ))?;
                     let allocated_args = args.iter().map(|v| self.alloc(v)).collect::<Result<Vec<_>>>()?;
                     // FIXME not in the spec?
-                    self.push(Value::Reference(receiver_addr))?;
+                    // self.push(Value::Reference(receiver_addr))?;
+                    // eprintln!("call with {:?}", args);
                     self.call_function(start, start + len, n_locals, &(
                         allocated_args.into_iter().chain(std::iter::once(receiver_addr as usize))
                     ).collect_vec())
@@ -390,20 +373,18 @@ impl Interpreter {
                     .collect_vec()
                     .join(", ")
                 ),
-                Value::Object { parent, fields, methods } => format!(
+                Value::Object { parent, fields, methods: _ } => format!(
                     "object({})",
                     (match this.get(*parent as usize).unwrap() {
                         Value::Null => None,
                         obj => Some(format!("..={}", go(this, depth + 1, &obj))),
-                    }).into_iter().chain({
-                        let mut fs = fields.iter().map(|(k, v)| format!(
-                            "{}={}",
-                            this.constant_pool[*k as usize].as_string().unwrap(),
-                            go(this, depth + 1, &this.get(*v as usize).unwrap())
-                        )).collect_vec();
-                        fs.sort();
-                        fs
-                    })
+                    }).into_iter().chain(fields.iter()
+                        .sorted_by_key(|f| this.constant_pool[f.0 as usize].as_string().unwrap())
+                        .map(|(k, v)| format!(
+                        "{}={}",
+                        this.constant_pool[*k as usize].as_string().unwrap(),
+                        go(this, depth + 1, &this.get(*v as usize).unwrap())
+                    )))
                     .collect_vec()
                     .join(", ")
                 ),
@@ -465,7 +446,7 @@ impl Interpreter {
         use Value::*;
         // FIXME avoid cloning
         match self.deref(obj.clone())? {
-            (addr, Object { parent, fields, methods }) => {
+            (addr, Object { parent: _, fields, methods: _ }) => {
                 let name_index = self.string_index(name).ok_or_else(||
                     anyhow!("the field {} is literally nowhere to be found. It's definitely not in {}, either.", name, self.show(obj))
                 )?;
@@ -502,7 +483,7 @@ impl Interpreter {
             match (escape, ch) {
                 (false, '~') => match args.get(arg_index) {
                     Some(arg) => {
-                        str.push_str(&self.show(&arg));
+                        str.push_str(&self.show(arg));
                         arg_index += 1
                     },
                     None => {
@@ -542,7 +523,7 @@ impl Interpreter {
     }
 }
 
-fn run(this: &mut Interpreter) -> Result<Value> {
+fn run(this: &mut Interpreter) -> Result<()> {
     'outer: loop {
         while matches!(this.call_stack.last().unwrap(), StackFrame { code_end, .. } if this.pc >= *code_end) {
             if this.call_stack.len() == 1 {
@@ -704,11 +685,11 @@ fn run(this: &mut Interpreter) -> Result<Value> {
                 Ok(())
             },
             Instr::CallMethod(i, n_args) => {
-                // TODO increment = false?
+                increment = false;
                 let name = this.constant_pool[i as usize].as_string()?;
                 let args = (0..n_args - 1).map(|_| this.pop()).collect::<Result<Vec<_>>>()?;
                 let receiver = this.pop()?;
-                this.call_method(receiver, name, &args.into_iter().rev().collect_vec())?;
+                this.call_method(receiver, name, &args)?;
                 Ok(())
             },
             Instr::CallFunction(i, n_args) => {
@@ -797,14 +778,14 @@ fn run(this: &mut Interpreter) -> Result<Value> {
 
         this.pc += increment as usize;
     };
-    Ok(Value::Null)
+    Ok(())
     // Err(anyhow!("nope"))
 }
 
 fn main() -> Result<()> {
     let mut i = Interpreter::load(&mut std::io::stdin())?;
     match i.execute() {
-        Ok(_) => Ok(()),
+        Ok(()) => Ok(()),
         Err(e) => {
             let Interpreter {
                 call_stack,
@@ -815,7 +796,6 @@ fn main() -> Result<()> {
                 pc,
                 stack,
                 heap: _,
-                globals: _,
             } = i;
             eprintln!(
                 "interpreter crash:\n\
