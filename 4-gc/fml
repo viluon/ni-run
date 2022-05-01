@@ -1,0 +1,34 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)"
+
+export RUST_BACKTRACE=1
+if [ "$1" = "execute" ]
+then
+    # our interpreter
+    "$SCRIPT_DIR/target/release/interpreter" < "$2"
+    # reference interpreter
+    # $PARSER execute < "$2"
+elif [ "$1" = "parse" ]
+then
+    $PARSER parse "$2" --format=json
+elif [ "$1" = "compile" ]
+then
+    # our compiler
+    "$SCRIPT_DIR/target/release/compiler" < "$2"
+    # reference compiler
+    # $PARSER compile --input-format=json < "$2"
+elif [ "$1" = "run" ]
+then
+    # our compiler, our interpreter
+    # $PARSER parse "$2" --format=json | "$SCRIPT_DIR/target/release/compiler" | "$SCRIPT_DIR/target/release/interpreter"
+    # reference compiler, our interpreter
+    $PARSER parse "$2" --format=lisp | $PARSER compile --input-format=lisp | "$SCRIPT_DIR/target/release/interpreter"
+    # our compiler, reference interpreter
+    # $PARSER parse "$2" --format=json | "$SCRIPT_DIR/target/release/compiler" | $PARSER execute < "$2"
+else
+    echo "Unknown command: $1. Supported commands: parse, compile, execute"
+    exit 1
+fi
