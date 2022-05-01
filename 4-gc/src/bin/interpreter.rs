@@ -140,8 +140,7 @@ impl Interpreter {
      * Call a method.
      * @warn Handles PC manipulation.
      */
-    fn call_method(&mut self, receiver: Value, name: u16, mut args: Vec<Value>) -> Result<()> {
-        let str_name = self.constant_pool[name as usize].as_str()?;
+    fn call_method(&mut self, receiver: Value, name: u16, args: Vec<Value>) -> Result<()> {
         match receiver {
             Value::Null | Value::Int(_) | Value::Bool(_) => {
                 (args.len() == 1).expect(|| anyhow!(
@@ -152,52 +151,61 @@ impl Interpreter {
                     self.show(&receiver),
                     args.len()
                 ))?;
-                self.push(self.call_builtin_method(receiver, str_name, args[0].clone())?)?;
+                self.push(self.call_builtin_method(receiver, self.constant_pool[name as usize].as_str()?, args[0].clone())?)?;
                 self.pc += 1;
                 Ok(())
             },
             Value::Reference(ptr) => {
-                let dereferenced = self.heap.read(ptr)?;
-                match dereferenced {
-                    HeapObject::Array(arr) => {
-                        // TODO check arity
-                        match (str_name, args[0].clone(), args.get(1)) {
-                            ("get", Value::Int(i), _) => {
-                                (i >= 0 && (i as usize) < arr.len()).expect(|| anyhow!("array index {} out of bounds", i))?;
-                                let v = self.heap.array_get(ptr, i as u32)?;
-                                self.push(v)?;
-                            },
-                            ("set", v, Some(&Value::Int(i))) => {
-                                (i >= 0 && (i as usize) < arr.len()).expect(|| anyhow!("array index {} out of bounds", i))?;
-                                self.heap.array_set(ptr, i as u32, v.clone())?;
-                                self.push(v)?;
-                            },
-                            ("get" | "set", v, _) => return Err(anyhow!(
-                                "indexing an array with a {} might work in PHP, but it won't work here.", self.show(&v)
-                            )),
-                            (invalid, _, _) => return Err(anyhow!(
-                                "this is actually the very first time someone thought to call {} on an array.", invalid
-                            )),
-                        };
-                        self.pc += 1;
-                        Ok(())
-                    },
-                    HeapObject::Object { parent, methods, fields: _ } => {
-                        match methods.get(&name) {
-                            Some(&i) => {
-                                let (_name, n_args, n_locals, start, len) = self.constant_pool[i as usize].as_method()?;
-                                (n_args as usize == args.len() + 1).expect(|| anyhow!(
-                                    "wrong number of arguments, {} expects {}, not {} (receiver and {:?})", name, n_args, args.len() + 1, args
-                                ))?;
-                                args.push(receiver);
-                                self.call_function(start, start + len, n_locals, &args)
-                            },
-                            None => self.call_method(parent, name, args),
-                        }
-                    },
+                match self.heap.read_tag(ptr)? {
+                    HeapTag::Array(len) => self.call_array_method(name, &args, len as i32, ptr),
+                    HeapTag::Object => self.call_object_method(ptr, name, args, receiver),
                 }
             },
         }
+    }
+
+    fn call_object_method(&mut self, ptr: Pointer, name: u16, mut args: Vec<Value>, receiver: Value) -> Result<()> {
+        let (parent, methods) = {
+            match self.heap.read(ptr)? {
+                HeapObject::Object { parent, methods, fields: _ } => (parent, methods),
+                _ => unreachable!(),
+            }
+        };
+
+        match methods.get(&name) {
+            Some(&i) => {
+                let (_name, n_args, n_locals, start, len) = self.constant_pool[i as usize].as_method()?;
+                (n_args as usize == args.len() + 1).expect(|| anyhow!(
+                    "wrong number of arguments, {} expects {}, not {} (receiver and {:?})", name, n_args, args.len() + 1, args
+                ))?;
+                args.push(receiver);
+                self.call_function(start, start + len, n_locals, &args)
+            },
+            None => self.call_method(parent, name, args),
+        }
+    }
+
+    fn call_array_method(&mut self, name: u16, args: &[Value], len: i32, ptr: Pointer) -> Result<()> {
+        match (self.constant_pool[name as usize].as_str()?, args[0].clone(), args.get(1)) {
+            ("get", Value::Int(i), _) => {
+                (i >= 0 && i < len).expect(|| anyhow!("array index {} out of bounds", i))?;
+                let v = self.heap.array_get(ptr, i as u32)?;
+                self.push(v)?;
+            },
+            ("set", v, Some(&Value::Int(i))) => {
+                (i >= 0 && i < len).expect(|| anyhow!("array index {} out of bounds", i))?;
+                self.heap.array_set(ptr, i as u32, v.clone())?;
+                self.push(v)?;
+            },
+            ("get" | "set", v, _) => return Err(anyhow!(
+                "indexing an array with a {} might work in PHP, but it won't work here.", self.show(&v)
+            )),
+            (invalid, _, _) => return Err(anyhow!(
+                "this is actually the very first time someone thought to call {} on an array.", invalid
+            )),
+        };
+        self.pc += 1;
+        Ok(())
     }
 
     fn show(&self, v: &Value) -> String {

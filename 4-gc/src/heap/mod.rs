@@ -23,6 +23,14 @@ impl Heap {
         } else { Err(anyhow!("invalid address: {:#06x}", addr)) }
     }
 
+    pub fn read_tag(&self, addr: Pointer) -> Result<HeapTag> {
+        let addr: u64 = addr.into();
+        let addr = addr as usize;
+        if addr < self.0.len() {
+            Ok(HeapTag::from(&self.0[addr..]))
+        } else { Err(anyhow!("invalid address: {:#06x}", addr)) }
+    }
+
     pub fn array_set(&mut self, arr: Pointer, i: u32, v: Value) -> Result<()> {
         let heap = self.0.as_mut_slice();
         let arr: u64 = arr.into();
@@ -39,30 +47,6 @@ impl Heap {
         (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
         Ok(Value::from_le_bytes(heap[offset .. offset + 8].try_into().unwrap()))
     }
-
-    // fn array_set(&mut self, arr: usize, i: u32, el: u64) -> Result<()> {
-    //     let heap = self.heap.as_mut_slice();
-    //     let offset = arr + 1 + 8 + i as usize * 8;
-    //     (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
-    //     heap[offset .. offset + 8].copy_from_slice(&el.to_le_bytes());
-    //     Ok(())
-    // }
-
-    // fn array_get(&self, arr: usize, i: u32) -> Result<u64> {
-    //     let heap = self.heap.as_slice();
-    //     let offset = arr + 1 + 8 + i as usize * 8;
-    //     (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
-    //     Ok(u64::from_le_bytes(heap[offset .. offset + 8].try_into().unwrap()))
-    // }
-
-    // fn deref(&self, mut v: Value) -> Result<(u64, Value)> {
-    //     let mut array_addr = None;
-    //     while let Value::Reference(addr) = v {
-    //         array_addr = Some(addr);
-    //         v = self.get(addr as usize)?
-    //     }
-    //     Ok((array_addr.ok_or_else(|| anyhow!("{:?} is not a reference!", v))?, v))
-    // }
 
     pub fn get_field(&mut self, ptr: Pointer, name: u16, str_name: &str) -> Result<&mut [u8/*; 8*/]> {
         use HeapObject::*;
@@ -113,7 +97,7 @@ pub enum HeapObject {
 }
 
 pub enum HeapTag {
-    Array, Object,
+    Array(u64), Object,
 }
 
 impl From<&Value> for [u8; 8] {
@@ -200,6 +184,17 @@ impl From<&[u8]> for Value {
             4 => Value::Null,
             5 => Value::Reference(Pointer::from_le_bytes(bytes[..6].try_into().unwrap())),
             _ => panic!("Invalid value tag"),
+        }
+    }
+}
+
+impl From<&[u8]> for HeapTag {
+    fn from(bytes: &[u8]) -> Self {
+        let tag = bytes[0];
+        match tag {
+            3 => HeapTag::Array(u64::from_le_bytes(bytes[1..9].try_into().unwrap())),
+            6 => HeapTag::Object,
+            _ => panic!("Invalid heap tag"),
         }
     }
 }
