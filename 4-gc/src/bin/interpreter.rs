@@ -19,7 +19,7 @@ struct StackFrame {
     // for a method, this is start + length
     // used to check if we're past the local code vector
     code_end: Pc,
-    locals: Vec<usize>,
+    locals: Vec<Value>,
     return_address: Pc,
 }
 
@@ -29,11 +29,11 @@ struct Interpreter {
     label_map: HashMap<String, Pc>,
     // the values are both heap addresses and constant pool indices,
     // depending on whether the global is a variable or a function
-    global_map: HashMap<u16, Either<usize, u16>>,
+    global_map: HashMap<u16, Either<Value, u16>>,
     code: Vec<Instr>,
     stack: Vec<Value>,
     call_stack: Vec<StackFrame>,
-    heap: Vec<u8>,
+    heap: Heap,
     pc: Pc,
 }
 
@@ -57,7 +57,7 @@ impl Interpreter {
         let mut init = Interpreter {
             stack: vec![],
             call_stack: vec![],
-            heap: vec![],
+            heap: Default::default(),
             global_map: Default::default(),
             constant_pool,
             label_map,
@@ -67,7 +67,7 @@ impl Interpreter {
 
         let bottom_frame = StackFrame {
             code_end: pc + length,
-            locals: (0..init_locals).map(|_| init.alloc(&Value::Null)).collect::<Result<_>>()?,
+            locals: (0..init_locals).map(|_| Value::Null).collect(),
             return_address: 0,
         };
 
@@ -75,7 +75,7 @@ impl Interpreter {
         init.init_with_globals(globals)
     }
 
-    fn init_with_globals(mut self, globals: Vec<u16>) -> Result<Interpreter> {
+    fn init_with_globals(self, globals: Vec<u16>) -> Result<Interpreter> {
         let mut global_map = HashMap::new();
         for &k_idx in globals.iter() {
             self.constant_pool.get(k_idx as usize)
@@ -86,7 +86,7 @@ impl Interpreter {
                         self.constant_pool.get(i as usize)
                             .ok_or_else(|| anyhow!("invalid global, {} is outside the constant pool", i))
                             .and_then(Constant::as_string)?;
-                        global_map.insert(i, Left(self.alloc(&Value::Null)?));
+                        global_map.insert(i, Left(Value::Null));
                         Ok(())
                     },
                     Constant::Method { name_idx, .. } => self.constant_pool[name_idx as usize]
@@ -99,27 +99,6 @@ impl Interpreter {
         }
 
         Ok(Interpreter { global_map, ..self })
-    }
-
-    fn alloc(&mut self, v: &Value) -> Result<usize> {
-        let addr = self.heap.len();
-        self.set(addr, v)?;
-        Ok(addr)
-    }
-
-    fn get(&self, addr: usize) -> Result<Value> {
-        if addr < self.heap.len() {
-            Ok(Value::from(&self.heap[addr..]))
-        } else { Err(anyhow!("invalid address: {:#06x}", addr)) }
-    }
-
-    fn set(&mut self, addr: usize, v: &Value) -> Result<()> {
-        let repr: Vec<u8> = v.into();
-        if self.heap.len() < addr + repr.len() {
-            self.heap.resize(addr + repr.len(), 0);
-        }
-        self.heap[addr..addr + repr.len()].copy_from_slice(repr.as_slice());
-        Ok(())
     }
 
     fn frame(&mut self) -> &mut StackFrame {
@@ -157,129 +136,101 @@ impl Interpreter {
         Ok(())
     }
 
-    fn array_set(&mut self, arr: usize, i: u32, el: u64) -> Result<()> {
-        let heap = self.heap.as_mut_slice();
-        let offset = arr + 1 + 8 + i as usize * 8;
-        (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
-        heap[offset .. offset + 8].copy_from_slice(&el.to_le_bytes());
-        Ok(())
-    }
-
-    fn array_get(&self, arr: usize, i: u32) -> Result<u64> {
-        let heap = self.heap.as_slice();
-        let offset = arr + 1 + 8 + i as usize * 8;
-        (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
-        Ok(u64::from_le_bytes(heap[offset .. offset + 8].try_into().unwrap()))
-    }
-
-    fn deref(&self, mut v: Value) -> Result<(u64, Value)> {
-        let mut array_addr = None;
-        while let Value::Reference(addr) = v {
-            array_addr = Some(addr);
-            v = self.get(addr as usize)?
-        }
-        Ok((array_addr.ok_or_else(|| anyhow!("{:?} is not a reference!", v))?, v))
-    }
-
     /**
      * Call a method.
      * @warn Handles PC manipulation.
      */
-    fn call_method(&mut self, receiver: Value, name: u16, args: &[Value]) -> Result<()> {
+    fn call_method(&mut self, receiver: Value, name: u16, mut args: Vec<Value>) -> Result<()> {
         let str_name = self.constant_pool[name as usize].as_str()?;
-        if matches!(receiver, Value::Int(_) | Value::Bool(_) | Value::Null) {
-            (args.len() == 1).expect(|| anyhow!(
-                "attempt to call {} on {} failed: \
-                primitive receivers only support methods \
-                of one argument, not {}",
-                name,
-                self.show(&receiver),
-                args.len()
-            ))?;
-            self.push(self.call_builtin_method(receiver, str_name, args[0].clone())?)?;
-            self.pc += 1;
-            return Ok(());
-        }
-
-        let dereferenced = self.deref(receiver.clone());
-        if let Ok((array_addr, Value::Array(arr))) = dereferenced {
-            // TODO check arity
-            match (str_name, args[0].clone(), args.get(1)) {
-                ("get", Value::Int(i), _) => {
-                    (i >= 0 && (i as usize) < arr.len()).expect(|| anyhow!("array index {} out of bounds", i))?;
-                    let v = self.get(self.array_get(array_addr as usize, i as u32)? as usize)?;
-                    self.push(v)?;
-                },
-                ("set", v, Some(&Value::Int(i))) => {
-                    (i >= 0 && (i as usize) < arr.len()).expect(|| anyhow!("array index {} out of bounds", i))?;
-                    let addr = self.alloc(&v)?;
-                    self.array_set(array_addr as usize, i as u32, addr as u64)?;
-                    self.push(v)?;
-                },
-                ("get" | "set", v, _) => return Err(anyhow!(
-                    "indexing an array with a {} might work in PHP, but it won't work here.", self.show(&v)
-                )),
-                (invalid, _, _) => return Err(anyhow!(
-                    "this is actually the very first time someone thought to call {} on an array.", invalid
-                )),
-            };
-            self.pc += 1;
-            Ok(())
-        } else if let Ok(
-            (receiver_addr, Value::Object { parent, methods, fields: _ })
-        ) = dereferenced {
-            match methods.get(&name) {
-                Some(&i) => {
-                    let (_name, n_args, n_locals, start, len) = self.constant_pool[i as usize].as_method()?;
-                    (n_args as usize == args.len() + 1).expect(|| anyhow!(
-                        "wrong number of arguments, {} expects {}, not {} (receiver and {:?})", name, n_args, args.len() + 1, args
-                    ))?;
-                    let mut allocated_args = Vec::with_capacity(n_args as usize + 1);
-                    for arg in args {
-                        allocated_args.push(self.alloc(arg)?);
-                    }
-                    allocated_args.push(receiver_addr as usize);
-                    self.call_function(start, start + len, n_locals, &allocated_args)
-                },
-                None => self.call_method(self.get(parent as usize)?, name, args),
-            }
-        } else {
-            Err(anyhow!("cannot call method on {}", self.show(&receiver)))
+        match receiver {
+            Value::Null | Value::Int(_) | Value::Bool(_) => {
+                (args.len() == 1).expect(|| anyhow!(
+                    "attempt to call {} on {} failed: \
+                    primitive receivers only support methods \
+                    of one argument, not {}",
+                    name,
+                    self.show(&receiver),
+                    args.len()
+                ))?;
+                self.push(self.call_builtin_method(receiver, str_name, args[0].clone())?)?;
+                self.pc += 1;
+                Ok(())
+            },
+            Value::Reference(ptr) => {
+                let dereferenced = self.heap.read(ptr)?;
+                match dereferenced {
+                    HeapObject::Array(arr) => {
+                        // TODO check arity
+                        match (str_name, args[0].clone(), args.get(1)) {
+                            ("get", Value::Int(i), _) => {
+                                (i >= 0 && (i as usize) < arr.len()).expect(|| anyhow!("array index {} out of bounds", i))?;
+                                let v = self.heap.array_get(ptr, i as u32)?;
+                                self.push(v)?;
+                            },
+                            ("set", v, Some(&Value::Int(i))) => {
+                                (i >= 0 && (i as usize) < arr.len()).expect(|| anyhow!("array index {} out of bounds", i))?;
+                                self.heap.array_set(ptr, i as u32, v.clone())?;
+                                self.push(v)?;
+                            },
+                            ("get" | "set", v, _) => return Err(anyhow!(
+                                "indexing an array with a {} might work in PHP, but it won't work here.", self.show(&v)
+                            )),
+                            (invalid, _, _) => return Err(anyhow!(
+                                "this is actually the very first time someone thought to call {} on an array.", invalid
+                            )),
+                        };
+                        self.pc += 1;
+                        Ok(())
+                    },
+                    HeapObject::Object { parent, methods, fields: _ } => {
+                        match methods.get(&name) {
+                            Some(&i) => {
+                                let (_name, n_args, n_locals, start, len) = self.constant_pool[i as usize].as_method()?;
+                                (n_args as usize == args.len() + 1).expect(|| anyhow!(
+                                    "wrong number of arguments, {} expects {}, not {} (receiver and {:?})", name, n_args, args.len() + 1, args
+                                ))?;
+                                args.push(receiver);
+                                self.call_function(start, start + len, n_locals, &args)
+                            },
+                            None => self.call_method(parent, name, args),
+                        }
+                    },
+                }
+            },
         }
     }
 
     fn show(&self, v: &Value) -> String {
-        fn go(this: &Interpreter, depth: u8, v: &Value) -> String {
-            if depth > 10 {
-                return "[deep!]".to_string();
-            }
-
-            match v {
-                Value::Int(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                &Value::Reference(addr) => go(this, depth + 1, &this.get(addr as usize).unwrap()),
-                Value::Array(arr) => format!("[{}]", arr
-                    .iter()
-                    .map(|&addr| go(this, depth + 1, &this.get(addr as usize).unwrap()))
-                    .collect_vec()
-                    .join(", ")
+        fn go_obj(this: &Interpreter, depth: u8, obj: &HeapObject) -> String {
+            match obj {
+                HeapObject::Array(arr) => format!("[{}]",
+                    arr.iter().map(|el| go(this, depth + 1, el)).collect_vec().join(", ")
                 ),
-                Value::Object { parent, fields, methods: _ } => format!(
+                HeapObject::Object { parent, fields, methods: _ } => format!(
                     "object({})",
-                    (match this.get(*parent as usize).unwrap() {
+                    (match parent {
                         Value::Null => None,
-                        obj => Some(format!("..={}", go(this, depth + 1, &obj))),
+                        obj => Some(format!("..={}", go(this, depth + 1, obj))),
                     }).into_iter().chain(fields.iter()
                         .sorted_by_key(|f| this.constant_pool[f.0 as usize].as_string().unwrap())
                         .map(|(k, v)| format!(
                         "{}={}",
                         this.constant_pool[*k as usize].as_string().unwrap(),
-                        go(this, depth + 1, &this.get(*v as usize).unwrap())
+                        go(this, depth + 1, v)
                     )))
                     .collect_vec()
                     .join(", ")
                 ),
+            }
+        }
+
+        fn go(this: &Interpreter, depth: u8, v: &Value) -> String {
+            if depth > 10 { return "[deep!]".to_string(); }
+            match v {
                 Value::Null => "null".to_string(),
+                Value::Int(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                &Value::Reference(ptr) => go_obj(this, depth + 1, &this.heap.read(ptr).unwrap()),
             }
         }
 
@@ -318,41 +269,26 @@ impl Interpreter {
         }
     }
 
-    fn call_function(&mut self, start: Pc, end: Pc, n_locals: u16, args: &[usize]) -> Result<()> {
-        let null_ptr = self.alloc(&Value::Null)?;
+    fn call_function(&mut self, start: Pc, end: Pc, n_locals: u16, args: &[Value]) -> Result<()> {
         self.call_stack.push(StackFrame {
             code_end: end,
             return_address: self.pc + 1,
-            locals: args.iter().rev().chain((0..n_locals).map(|_| &null_ptr)).copied().collect(),
+            locals: args.iter().rev().chain((0..n_locals).map(|_| &Value::Null)).cloned().collect(),
         });
         self.pc = start;
         Ok(())
     }
 
-    fn addr_of_local(&mut self, i: u16) -> Result<&mut usize> {
-        self.frame().locals.get_mut(i as usize).ok_or_else(|| anyhow!("index {} out of range", i))
-    }
-
-    fn get_field(&mut self, obj: &Value, name: u16) -> Result<&mut [u8/*; 8*/]> {
-        use Value::*;
+    fn get_field(&mut self, ptr: Pointer, name: u16) -> Result<&mut [u8/*; 8*/]> {
         let str_name = self.constant_pool[name as usize].as_str().unwrap();
-        // FIXME avoid cloning
-        match self.deref(obj.clone())? {
-            (addr, Object { parent: _, fields, methods: _ }) => {
-                let index = fields.binary_search_by_key(&name, |p| p.0)
-                    // TODO tail-recurse for parent
-                    .map_err(|_| anyhow!("no such field {}", str_name))?;
+        // let refr = Value::Reference(ptr);
 
-                let field_value_addr = addr as usize
-                    + 1  // tag
-                    + 24 // parent, field and method counts
-                    + index as usize * 10 // field index
-                    + 2; // skip key
-                Ok(self.heap[field_value_addr .. field_value_addr + 8].as_mut())
-            },
-            _ => Err(anyhow!(
-                "cannot access field {} of {}. In fact, it doesn't even matter
-                what the field's name is, as {} is not an object.", str_name, self.show(obj), self.show(obj)
+        match self.heap.get_field(ptr, name, str_name) {
+            Ok(slice) => Ok(slice),
+            // FIXME resolve borrowck issues and give the original error message
+            Err(_) => Err(anyhow!(
+                "cannot access field {} of ???. In fact, it doesn't even matter
+                what the field's name is, as ??? is not an object.", str_name, //self.show(&refr), self.show(&refr)
             )),
         }
     }
@@ -418,13 +354,13 @@ fn run(this: &mut Interpreter) -> Result<()> {
             println!("\tstack: {:?}", this.stack);
             print!("pc: {pc}, globals: ", pc = this.pc);
             for (name, target) in this.global_map.iter() {
-                if let Left(addr) = target {
-                    print!("{}.{}={} ", addr, name, this.show(&this.get(*addr)?));
+                if let Left(v) = target {
+                    print!("{}={} ", name, this.show(v));
                 }
             }
             print!(" locals: ");
             for (i, addr) in this.frame().locals.clone().into_iter().enumerate() {
-                print!("[{}]={} ", i, this.show(&this.get(addr)?));
+                print!("[{}]={} ", i, this.show(&addr));
             }
             println!("i: {instr:?}", instr = this.code[this.pc]);
         }
@@ -469,16 +405,13 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 Ok(())
             },
             Instr::GetLocal(i) => {
-                let addr = *this.addr_of_local(i)?;
-                this.push(match this.get(addr)? {
-                    Value::Array(_) | Value::Object { .. } => Value::Reference(addr as u64),
-                    v => v,
-                })?;
+                let v = this.frame().locals[i as usize].clone();
+                this.push(v)?;
                 Ok(())
             },
             Instr::SetLocal(i) => {
                 let v = this.peek()?;
-                *this.addr_of_local(i)? = this.alloc(&v)?;
+                this.frame().locals[i as usize] = v;
                 Ok(())
             },
             Instr::GetGlobal(i) => {
@@ -489,7 +422,8 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 Ok(())
             },
             Instr::GetGlobalDirect(name) => {
-                this.push(this.get(this.global_map[&name].unwrap_left())?)?;
+                let v = this.global_map[&name].clone().unwrap_left();
+                this.push(v)?;
                 Ok(())
             },
             Instr::SetGlobal(i) => {
@@ -501,8 +435,7 @@ fn run(this: &mut Interpreter) -> Result<()> {
             },
             Instr::SetGlobalDirect(name) => {
                 let v = this.peek()?;
-                let addr = this.alloc(&v)?;
-                this.global_map.insert(name, Left(addr));
+                this.global_map.insert(name, Left(v));
                 Ok(())
             },
             Instr::GetField(i) => {
@@ -513,10 +446,12 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 Ok(())
             },
             Instr::GetFieldDirect(name) => {
-                let obj = this.pop()?;
-                let ref_bytes = this.get_field(&obj, name)?;
-                let addr = u64::from_le_bytes(ref_bytes.try_into().unwrap()) as usize;
-                this.push(this.get(addr)?)?;
+                let ptr = this.pop()?.as_reference(|_|
+                    anyhow!("attempt to get a field from a non-reference value")
+                )?;
+                // TODO move to the heap module
+                let v = Value::from(this.get_field(ptr, name)? as &[u8]);
+                this.push(v)?;
                 Ok(())
             },
             Instr::SetField(i) => {
@@ -528,10 +463,12 @@ fn run(this: &mut Interpreter) -> Result<()> {
             },
             Instr::SetFieldDirect(name) => {
                 let v = this.pop()?;
-                let obj = this.pop()?;
-                let v_addr = this.alloc(&v)?;
-                let ref_bytes = this.get_field(&obj, name)?;
-                ref_bytes.copy_from_slice(v_addr.to_le_bytes().as_slice());
+                let ptr = this.pop()?.as_reference(|_|
+                    anyhow!("attempt to set a field on a non-reference value")
+                )?;
+                // TODO move to the heap module
+                let ref_bytes = this.get_field(ptr, name)?;
+                ref_bytes.copy_from_slice(v.to_le_bytes().as_slice());
                 this.push(v)?;
                 Ok(())
             },
@@ -569,13 +506,13 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 increment = false;
                 let args = (0..n_args - 1).map(|_| this.pop()).collect::<Result<Vec<_>>>()?;
                 let receiver = this.pop()?;
-                this.call_method(receiver, i, &args)?;
+                this.call_method(receiver, i, args)?;
                 Ok(())
             },
             Instr::CallFunction(i, n_args) => {
                 increment = false;
                 let global_name = this.constant_pool[i as usize].as_str()?;
-                let fn_addr = this.global_map.get(&i)
+                let fn_addr = this.global_map.get(&i).cloned()
                     .ok_or_else(|| anyhow!("compiler bug: global {} not found", global_name))?
                     .right()
                     .ok_or_else(|| anyhow!("attempt to call variable {}", global_name))?;
@@ -586,7 +523,7 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 )?;
 
                 let args = (0..n_args)
-                    .map(|_| this.pop().and_then(|arg| this.alloc(&arg)))
+                    .map(|_| this.pop())
                     .collect::<Result<Vec<_>>>()?;
 
                 this.call_function(start, start + len, n_locals, &args)?;
@@ -604,10 +541,8 @@ fn run(this: &mut Interpreter) -> Result<()> {
 
                 (len >= 0).expect(|| anyhow!("the length of an array must be non-negative"))?;
                 let len = len as usize;
-                let el_addr = this.alloc(&initial)? as u64;
-                let arr_addr = this.alloc(&Value::Array(vec![el_addr; len]))?;
-
-                this.push(Value::Reference(arr_addr as u64))
+                let ptr = this.heap.alloc(&HeapObject::Array(vec![initial; len]))?;
+                this.push(Value::Reference(ptr))
             },
             Instr::Object(class) => {
                 // FIXME do this all in a single loop
@@ -628,31 +563,23 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 let mut methods = vec![];
                 for (method_index, slot) in members.into_iter() {
                     match slot {
-                        Constant::Slot(i) => {
-                            let v = this.pop()?;
-                            let addr = this.alloc(&v)?;
-                            fields.push((i, addr as u64));
-                        },
-                        Constant::Method { name_idx, .. } => {
-                            methods.push((name_idx, method_index as u16))
-                        },
+                        Constant::Slot(i) => fields.push((i, this.pop()?)),
+                        Constant::Method { name_idx, .. } => methods.push((name_idx, method_index as u16)),
                         _ => unreachable!(),
                     }
                 }
 
                 fields.sort_by_key(|p| p.0);
 
-                // FIXME this is one of the places with the stack value / heap object distinction
                 let parent = this.pop()?;
-                let parent = this.alloc(&parent)? as u64;
-                let obj = Value::Object {
+                let obj = HeapObject::Object {
                     parent,
                     fields,
                     methods: methods.into_iter().collect(),
                 };
 
-                let addr = this.alloc(&obj)? as u64;
-                this.push(Value::Reference(addr))
+                let ptr = this.heap.alloc(&obj)?;
+                this.push(Value::Reference(ptr))
             },
         }?;
 
@@ -719,26 +646,27 @@ mod test {
 
     #[test]
     fn arrays() -> Result<()> {
+        use HeapObject::Array;
         use Value::*;
 
-        let mut i = dummy();
-        let null = i.alloc(&Null)? as u64;
-        let arr = i.alloc(&Array(vec![null; 10]))?;
+        let i = dummy();
+        let mut h = i.heap;
+        let arr = h.alloc(&Array(vec![Null; 10]))?;
 
-        let int1 = i.alloc(&Int(1))? as u64;
-        let int2 = i.alloc(&Int(-2))? as u64;
-        let int3 = i.alloc(&Int(3))? as u64;
-        let int4 = i.alloc(&Int(4))? as u64;
+        let int1 = Int(1);
+        let int2 = Int(-2);
+        let int3 = Int(3);
+        let int4 = Int(4);
 
-        i.array_set(arr, 1, int2)?;
-        i.array_set(arr, 0, int1)?;
-        i.array_set(arr, 2, int3)?;
-        i.array_set(arr, 9, int4)?;
+        h.array_set(arr, 1, int2)?;
+        h.array_set(arr, 0, int1)?;
+        h.array_set(arr, 2, int3)?;
+        h.array_set(arr, 9, int4)?;
 
-        assert_eq!(i.get(i.array_get(arr, 0)? as usize)?, Int(1));
-        assert_eq!(i.get(i.array_get(arr, 1)? as usize)?, Int(-2));
-        assert_eq!(i.get(i.array_get(arr, 2)? as usize)?, Int(3));
-        assert_eq!(i.get(i.array_get(arr, 9)? as usize)?, Int(4));
+        assert_eq!(h.array_get(arr, 0)?, Int(1));
+        assert_eq!(h.array_get(arr, 1)?, Int(-2));
+        assert_eq!(h.array_get(arr, 2)?, Int(3));
+        assert_eq!(h.array_get(arr, 9)?, Int(4));
 
         Ok(())
     }

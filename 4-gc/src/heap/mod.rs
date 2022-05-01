@@ -1,8 +1,101 @@
 use std::collections::HashMap;
 use itertools::Itertools;
 use anyhow::Result;
+use anyhow::anyhow;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+use crate::util::BooleanAssertions;
+
+#[derive(Debug, Default)]
+pub struct Heap(Vec<u8>);
+
+impl Heap {
+    pub fn alloc(&mut self, obj: &HeapObject) -> Result<Pointer> {
+        let addr = self.0.len();
+        self.set(addr, obj)?;
+        Ok(Pointer::from(addr as u64))
+    }
+
+    pub fn read(&self, addr: Pointer) -> Result<HeapObject> {
+        let addr: u64 = addr.into();
+        let addr = addr as usize;
+        if addr < self.0.len() {
+            Ok(HeapObject::from(&self.0[addr..]))
+        } else { Err(anyhow!("invalid address: {:#06x}", addr)) }
+    }
+
+    pub fn array_set(&mut self, arr: Pointer, i: u32, v: Value) -> Result<()> {
+        let heap = self.0.as_mut_slice();
+        let arr: u64 = arr.into();
+        let offset = arr as usize + 1 + 8 + i as usize * 8;
+        (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
+        heap[offset .. offset + 8].copy_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn array_get(&self, arr: Pointer, i: u32) -> Result<Value> {
+        let heap = self.0.as_slice();
+        let arr: u64 = arr.into();
+        let offset = arr as usize + 1 + 8 + i as usize * 8;
+        (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
+        Ok(Value::from_le_bytes(heap[offset .. offset + 8].try_into().unwrap()))
+    }
+
+    // fn array_set(&mut self, arr: usize, i: u32, el: u64) -> Result<()> {
+    //     let heap = self.heap.as_mut_slice();
+    //     let offset = arr + 1 + 8 + i as usize * 8;
+    //     (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
+    //     heap[offset .. offset + 8].copy_from_slice(&el.to_le_bytes());
+    //     Ok(())
+    // }
+
+    // fn array_get(&self, arr: usize, i: u32) -> Result<u64> {
+    //     let heap = self.heap.as_slice();
+    //     let offset = arr + 1 + 8 + i as usize * 8;
+    //     (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
+    //     Ok(u64::from_le_bytes(heap[offset .. offset + 8].try_into().unwrap()))
+    // }
+
+    // fn deref(&self, mut v: Value) -> Result<(u64, Value)> {
+    //     let mut array_addr = None;
+    //     while let Value::Reference(addr) = v {
+    //         array_addr = Some(addr);
+    //         v = self.get(addr as usize)?
+    //     }
+    //     Ok((array_addr.ok_or_else(|| anyhow!("{:?} is not a reference!", v))?, v))
+    // }
+
+    pub fn get_field(&mut self, ptr: Pointer, name: u16, str_name: &str) -> Result<&mut [u8/*; 8*/]> {
+        use HeapObject::*;
+        // FIXME avoid cloning
+        match self.read(ptr)? {
+            Object { parent: _, fields, methods: _ } => {
+                let index = fields.binary_search_by_key(&name, |p| p.0)
+                    // TODO tail-recurse for parent
+                    .map_err(|_| anyhow!("no such field {}", str_name))?;
+
+                let addr: u64 = ptr.into();
+                let field_value_addr = addr as usize
+                    + 1  // tag
+                    + 24 // parent, field and method counts
+                    + index as usize * 10 // field index
+                    + 2; // skip key
+                Ok(self.0[field_value_addr .. field_value_addr + 8].as_mut())
+            },
+            _ => Err(anyhow!("not an object")),
+        }
+    }
+
+    fn set(&mut self, addr: usize, obj: &HeapObject) -> Result<()> {
+        let repr: Vec<u8> = obj.into();
+        if self.0.len() < addr + repr.len() {
+            self.0.resize(addr + repr.len(), 0);
+        }
+        self.0[addr..addr + repr.len()].copy_from_slice(&repr);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Pointer(u16, u32);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,7 +109,7 @@ pub enum Value {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeapObject {
     Array(Vec<Value>), // TODO: copy on write?
-    Object { parent: Pointer, fields: Vec<(u16, Value)>, methods: HashMap<u16, u16> },
+    Object { parent: Value, fields: Vec<(u16, Value)>, methods: HashMap<u16, u16> },
 }
 
 pub enum HeapTag {
@@ -36,7 +129,7 @@ impl From<&Value> for [u8; 8] {
 }
 
 impl Value {
-    fn to_le_bytes(&self) -> [u8; 8] {
+    pub fn to_le_bytes(&self) -> [u8; 8] {
         self.into()
     }
 
@@ -46,19 +139,26 @@ impl Value {
 }
 
 impl Pointer {
-    #[inline(always)]
-    fn u64(&self) -> u64 {
-        (self.0 as u64) << 32 | self.1 as u64
-    }
-
     fn from_le_bytes(bytes: &[u8; 6]) -> Pointer {
         Pointer(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), u32::from_le_bytes(bytes[2..6].try_into().unwrap()))
     }
 
-    fn to_le_bytes(&self) -> [u8; 6] {
+    fn to_le_bytes(self) -> [u8; 6] {
         let [a1, a2] = self.0.to_le_bytes();
         let [a3, a4, a5, a6] = self.1.to_le_bytes();
         [a1, a2, a3, a4, a5, a6]
+    }
+}
+
+impl From<u64> for Pointer {
+    fn from(addr: u64) -> Pointer {
+        Pointer((addr >> 32) as u16, addr as u32)
+    }
+}
+
+impl From<Pointer> for u64 {
+    fn from(ptr: Pointer) -> u64 {
+        (ptr.0 as u64) << 32 | (ptr.1 as u64)
     }
 }
 
@@ -71,7 +171,6 @@ impl From<&HeapObject> for Vec<u8> {
             ].concat()),
             HeapObject::Object { parent, fields, methods } => (6, {vec![
                 (parent.to_le_bytes().to_vec()),
-                vec![0, 0], // padding
                 (fields.len() as u64).to_le_bytes().to_vec(),
                 (methods.len() as u64).to_le_bytes().to_vec(),
                 fields.iter().flat_map(|(k, v)| {
@@ -119,7 +218,7 @@ impl From<&[u8]> for HeapObject {
                 v
             }),
             6 => {
-                let parent = Pointer::from_le_bytes(bytes[..6].try_into().unwrap());
+                let parent = Value::from_le_bytes(bytes[..8].try_into().unwrap());
                 let len_fields = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
                 let len_methods = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
                 let mut bytes = &bytes[24..];
@@ -155,6 +254,13 @@ impl Value {
     pub fn as_int<F: FnOnce(&Value) -> anyhow::Error>(&self, err: F) -> Result<i32> {
         match self {
             Value::Int(i) => Ok(*i),
+            v => Err(err(v)),
+        }
+    }
+
+    pub fn as_reference<F: FnOnce(&Value) -> anyhow::Error>(&self, err: F) -> Result<Pointer> {
+        match self {
+            Value::Reference(p) => Ok(*p),
             v => Err(err(v)),
         }
     }
