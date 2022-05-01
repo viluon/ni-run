@@ -1,6 +1,6 @@
 #![feature(fn_traits, associated_type_defaults)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use fml_bc_compiler::util::BooleanAssertions;
 use itertools::Itertools;
 use itertools::Either;
@@ -17,7 +17,7 @@ enum Value {
     Bool(bool),
     Reference(u64),
     Array(Vec<u64>), // TODO: copy on write?
-    Object { parent: u64, fields: Vec<(u16, u64)>, methods: BTreeMap<u16, u16> },
+    Object { parent: u64, fields: Vec<(u16, u64)>, methods: HashMap<u16, u16> },
     Null,
 }
 
@@ -75,8 +75,8 @@ impl From<&[u8]> for Value {
                 let len_fields = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
                 let len_methods = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
                 let mut bytes = &bytes[24..];
-                let mut fields = vec![];
-                let mut methods = BTreeMap::new();
+                let mut fields = Vec::with_capacity(len_fields);
+                let mut methods = HashMap::with_capacity(len_methods);
                 for _ in 0..len_fields {
                     let key = u16::from_le_bytes(bytes[..2].try_into().unwrap());
                     let value = u64::from_le_bytes(bytes[2..10].try_into().unwrap());
@@ -130,10 +130,10 @@ struct StackFrame {
 #[derive(Default)]
 struct Interpreter {
     constant_pool: Vec<Constant>,
-    label_map: BTreeMap<String, Pc>,
-    // the keys are both heap addresses and constant pool indices,
+    label_map: HashMap<String, Pc>,
+    // the values are both heap addresses and constant pool indices,
     // depending on whether the global is a variable or a function
-    global_map: BTreeMap<String, Either<usize, u16>>,
+    global_map: HashMap<u16, Either<usize, u16>>,
     code: Vec<Instr>,
     stack: Vec<Value>,
     call_stack: Vec<StackFrame>,
@@ -180,23 +180,23 @@ impl Interpreter {
     }
 
     fn init_with_globals(mut self, globals: Vec<u16>) -> Result<Interpreter> {
-        let mut global_map = BTreeMap::new();
+        let mut global_map = HashMap::new();
         for &k_idx in globals.iter() {
             self.constant_pool.get(k_idx as usize)
                 .ok_or_else(|| anyhow!("invalid global, {} is outside the constant pool", k_idx))
                 .cloned()
                 .and_then(|k| match k {
                     Constant::Slot(i) => {
-                        let name = self.constant_pool.get(i as usize)
+                        self.constant_pool.get(i as usize)
                             .ok_or_else(|| anyhow!("invalid global, {} is outside the constant pool", i))
                             .and_then(Constant::as_string)?;
-                        global_map.insert(name, Left(self.alloc(&Value::Null)?));
+                        global_map.insert(i, Left(self.alloc(&Value::Null)?));
                         Ok(())
                     },
                     Constant::Method { name_idx, .. } => self.constant_pool[name_idx as usize]
                         .as_string()
-                        .map(|name| {
-                            global_map.insert(name, Right(k_idx));
+                        .map(|_| {
+                            global_map.insert(name_idx, Right(k_idx));
                         }),
                     _ => Err(anyhow!("Invalid global {:?}", k)),
                 })?;
@@ -289,7 +289,8 @@ impl Interpreter {
      * Call a method.
      * @warn Handles PC manipulation.
      */
-    fn call_method(&mut self, receiver: Value, name: String, args: &[Value]) -> Result<()> {
+    fn call_method(&mut self, receiver: Value, name: u16, args: &[Value]) -> Result<()> {
+        let str_name = self.constant_pool[name as usize].as_str()?;
         if matches!(receiver, Value::Int(_) | Value::Bool(_) | Value::Null) {
             (args.len() == 1).expect(|| anyhow!(
                 "attempt to call {} on {} failed: \
@@ -299,12 +300,15 @@ impl Interpreter {
                 self.show(&receiver),
                 args.len()
             ))?;
-            self.push(self.call_builtin_method(receiver, name.as_str(), args[0].clone())?)?;
+            self.push(self.call_builtin_method(receiver, str_name, args[0].clone())?)?;
             self.pc += 1;
-            Ok(())
-        } else if let Ok((array_addr, Value::Array(arr))) = self.deref(receiver.clone()) {
+            return Ok(());
+        }
+
+        let dereferenced = self.deref(receiver.clone());
+        if let Ok((array_addr, Value::Array(arr))) = dereferenced {
             // TODO check arity
-            match (name.as_str(), args[0].clone(), args.get(1)) {
+            match (str_name, args[0].clone(), args.get(1)) {
                 ("get", Value::Int(i), _) => {
                     (i >= 0 && (i as usize) < arr.len()).expect(|| anyhow!("array index {} out of bounds", i))?;
                     let v = self.get(self.array_get(array_addr as usize, i as u32)? as usize)?;
@@ -327,30 +331,25 @@ impl Interpreter {
             Ok(())
         } else if let Ok(
             (receiver_addr, Value::Object { parent, methods, fields: _ })
-        ) = self.deref(receiver.clone()) {
-            match methods.get(&self.string_index(name.as_str()).unwrap()) {
+        ) = dereferenced {
+            match methods.get(&name) {
                 Some(&i) => {
                     let (_name, n_args, n_locals, start, len) = self.constant_pool[i as usize].as_method()?;
                     (n_args as usize == args.len() + 1).expect(|| anyhow!(
                         "wrong number of arguments, {} expects {}, not {} (receiver and {:?})", name, n_args, args.len() + 1, args
                     ))?;
-                    let allocated_args = args.iter().map(|v| self.alloc(v)).collect::<Result<Vec<_>>>()?;
-                    // FIXME not in the spec?
-                    // self.push(Value::Reference(receiver_addr))?;
-                    // eprintln!("call with {:?}", args);
-                    self.call_function(start, start + len, n_locals, &(
-                        allocated_args.into_iter().chain(std::iter::once(receiver_addr as usize))
-                    ).collect_vec())
+                    let mut allocated_args = Vec::with_capacity(n_args as usize + 1);
+                    for arg in args {
+                        allocated_args.push(self.alloc(arg)?);
+                    }
+                    allocated_args.push(receiver_addr as usize);
+                    self.call_function(start, start + len, n_locals, &allocated_args)
                 },
                 None => self.call_method(self.get(parent as usize)?, name, args),
             }
         } else {
             Err(anyhow!("cannot call method on {}", self.show(&receiver)))
         }
-    }
-
-    fn string_index(&self, s: &str) -> Option<u16> {
-        self.constant_pool.iter().position(|c| matches!(c.as_string(), Ok(k) if k == s)).map(|pos| pos as u16)
     }
 
     fn show(&self, v: &Value) -> String {
@@ -438,18 +437,15 @@ impl Interpreter {
         self.frame().locals.get_mut(i as usize).ok_or_else(|| anyhow!("index {} out of range", i))
     }
 
-    fn get_field(&mut self, obj: &Value, name: &str) -> Result<&mut [u8/*; 8*/]> {
+    fn get_field(&mut self, obj: &Value, name: u16) -> Result<&mut [u8/*; 8*/]> {
         use Value::*;
+        let str_name = self.constant_pool[name as usize].as_str().unwrap();
         // FIXME avoid cloning
         match self.deref(obj.clone())? {
             (addr, Object { parent: _, fields, methods: _ }) => {
-                let name_index = self.string_index(name).ok_or_else(||
-                    anyhow!("the field {} is literally nowhere to be found. It's definitely not in {}, either.", name, self.show(obj))
-                )?;
-
-                let index = fields.binary_search_by_key(&name_index, |p| p.0)
+                let index = fields.binary_search_by_key(&name, |p| p.0)
                     // TODO tail-recurse for parent
-                    .map_err(|_| anyhow!("no such field {}", name))?;
+                    .map_err(|_| anyhow!("no such field {}", str_name))?;
 
                 let field_value_addr = addr as usize
                     + 1  // tag
@@ -460,7 +456,7 @@ impl Interpreter {
             },
             _ => Err(anyhow!(
                 "cannot access field {} of {}. In fact, it doesn't even matter
-                what the field's name is, as {} is not an object.", name, self.show(obj), self.show(obj)
+                what the field's name is, as {} is not an object.", str_name, self.show(obj), self.show(obj)
             )),
         }
     }
@@ -592,8 +588,8 @@ fn run(this: &mut Interpreter) -> Result<()> {
             Instr::GetGlobal(i) => {
                 // replace with a direct dereference
                 increment = false;
-                let name = this.constant_pool[i as usize].as_string()?;
-                this.code[this.pc] = Instr::GetGlobalDirect(name);
+                // let name = this.constant_pool[i as usize].as_string()?;
+                this.code[this.pc] = Instr::GetGlobalDirect(i);
                 Ok(())
             },
             Instr::GetGlobalDirect(name) => {
@@ -603,8 +599,8 @@ fn run(this: &mut Interpreter) -> Result<()> {
             Instr::SetGlobal(i) => {
                 // replace with a direct set
                 increment = false;
-                let name = this.constant_pool[i as usize].as_string()?;
-                this.code[this.pc] = Instr::SetGlobalDirect(name);
+                // let name = this.constant_pool[i as usize].as_string()?;
+                this.code[this.pc] = Instr::SetGlobalDirect(i);
                 Ok(())
             },
             Instr::SetGlobalDirect(name) => {
@@ -616,13 +612,13 @@ fn run(this: &mut Interpreter) -> Result<()> {
             Instr::GetField(i) => {
                 // replace with a direct get
                 increment = false;
-                let name = this.constant_pool[i as usize].as_string()?;
-                this.code[this.pc] = Instr::GetFieldDirect(name);
+                // let name = this.constant_pool[i as usize].as_string()?;
+                this.code[this.pc] = Instr::GetFieldDirect(i);
                 Ok(())
             },
             Instr::GetFieldDirect(name) => {
                 let obj = this.pop()?;
-                let ref_bytes = this.get_field(&obj, name.as_str())?;
+                let ref_bytes = this.get_field(&obj, name)?;
                 let addr = u64::from_le_bytes(ref_bytes.try_into().unwrap()) as usize;
                 this.push(this.get(addr)?)?;
                 Ok(())
@@ -630,15 +626,15 @@ fn run(this: &mut Interpreter) -> Result<()> {
             Instr::SetField(i) => {
                 // replace with a direct set
                 increment = false;
-                let name = this.constant_pool[i as usize].as_string()?;
-                this.code[this.pc] = Instr::SetFieldDirect(name);
+                // let name = this.constant_pool[i as usize].as_string()?;
+                this.code[this.pc] = Instr::SetFieldDirect(i);
                 Ok(())
             },
             Instr::SetFieldDirect(name) => {
                 let v = this.pop()?;
                 let obj = this.pop()?;
                 let v_addr = this.alloc(&v)?;
-                let ref_bytes = this.get_field(&obj, name.as_str())?;
+                let ref_bytes = this.get_field(&obj, name)?;
                 ref_bytes.copy_from_slice(v_addr.to_le_bytes().as_slice());
                 this.push(v)?;
                 Ok(())
@@ -675,16 +671,15 @@ fn run(this: &mut Interpreter) -> Result<()> {
             },
             Instr::CallMethod(i, n_args) => {
                 increment = false;
-                let name = this.constant_pool[i as usize].as_string()?;
                 let args = (0..n_args - 1).map(|_| this.pop()).collect::<Result<Vec<_>>>()?;
                 let receiver = this.pop()?;
-                this.call_method(receiver, name, &args)?;
+                this.call_method(receiver, i, &args)?;
                 Ok(())
             },
             Instr::CallFunction(i, n_args) => {
                 increment = false;
-                let global_name = this.constant_pool[i as usize].as_string()?;
-                let fn_addr = this.global_map.get(&global_name)
+                let global_name = this.constant_pool[i as usize].as_str()?;
+                let fn_addr = this.global_map.get(&i)
                     .ok_or_else(|| anyhow!("compiler bug: global {} not found", global_name))?
                     .right()
                     .ok_or_else(|| anyhow!("attempt to call variable {}", global_name))?;

@@ -8,9 +8,9 @@ export RUST_BACKTRACE=1
 if [ "$1" = "execute" ]
 then
     # our interpreter
-    # "$SCRIPT_DIR/target/release/interpreter" < "$2"
+    "$SCRIPT_DIR/target/release/interpreter" < "$2"
     # reference interpreter
-    $PARSER execute < "$2"
+    # $PARSER execute < "$2"
 elif [ "$1" = "parse" ]
 then
     $PARSER parse "$2" --format=json

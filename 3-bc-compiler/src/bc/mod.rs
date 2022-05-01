@@ -1,7 +1,7 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use itertools::Itertools;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use crate::util::*;
 
@@ -60,13 +60,13 @@ pub enum Instr {
     GetLocal(u16),
     SetLocal(u16),
     GetGlobal(u16),
-    GetGlobalDirect(String),
+    GetGlobalDirect(u16),
     SetGlobal(u16),
-    SetGlobalDirect(String),
+    SetGlobalDirect(u16),
     GetField(u16),
-    GetFieldDirect(String),
+    GetFieldDirect(u16),
     SetField(u16),
-    SetFieldDirect(String),
+    SetFieldDirect(u16),
     Label(u16),
     Jump(u16),
     JumpDirect(Pc), // FIXME: bumps repr size (actually, Strings do too)
@@ -94,6 +94,13 @@ impl Constant {
     pub fn as_string(&self) -> Result<String> {
         match self {
             Constant::String(s) => Ok(s.clone()),
+            k => Err(anyhow!("expected string, got {:?}", k))
+        }
+    }
+
+    pub fn as_str(&self) -> Result<&str> {
+        match self {
+            Constant::String(s) => Ok(s.as_str()),
             k => Err(anyhow!("expected string, got {:?}", k))
         }
     }
@@ -267,9 +274,9 @@ pub fn parse_entry_point<'a, It: Iterator<Item = &'a u8>>(iter: &mut It) -> Resu
 }
 
 pub fn collect_labels(constant_pool: &mut Vec<Constant>, code: Vec<Instr>)
--> Result<(Vec<Instr>, BTreeMap<String, Pc>)> {
+-> Result<(Vec<Instr>, HashMap<String, Pc>)> {
     let mut patched = vec![];
-    let mut labels = BTreeMap::new();
+    let mut labels = HashMap::new();
 
     for (i, instr) in code.into_iter().enumerate() {
         if let Instr::Label(name_idx) = instr {
