@@ -257,9 +257,6 @@ impl Interpreter {
             return_address,
             locals: _,
         } = self.call_stack.pop().unwrap();
-        (!self.call_stack.is_empty()).expect(||
-            anyhow!("popped the global frame")
-        )?;
         self.pc = return_address;
         Ok(())
     }
@@ -307,23 +304,22 @@ impl Interpreter {
             Ok(())
         } else if let Ok((array_addr, Value::Array(arr))) = self.deref(receiver.clone()) {
             // TODO check arity
-            match (name.as_str(), args[0].clone()) {
-                ("get", Value::Int(i)) => {
+            match (name.as_str(), args[0].clone(), args.get(1)) {
+                ("get", Value::Int(i), _) => {
                     (i >= 0 && (i as usize) < arr.len()).expect(|| anyhow!("array index {} out of bounds", i))?;
                     let v = self.get(self.array_get(array_addr as usize, i as u32)? as usize)?;
                     self.push(v)?;
                 },
-                ("set", Value::Int(i)) => {
+                ("set", v, Some(&Value::Int(i))) => {
                     (i >= 0 && (i as usize) < arr.len()).expect(|| anyhow!("array index {} out of bounds", i))?;
-                    let v = args[1].clone();
                     let addr = self.alloc(&v)?;
                     self.array_set(array_addr as usize, i as u32, addr as u64)?;
                     self.push(v)?;
                 },
-                ("get" | "set", v) => return Err(anyhow!(
+                ("get" | "set", v, _) => return Err(anyhow!(
                     "indexing an array with a {} might work in PHP, but it won't work here.", self.show(&v)
                 )),
-                (invalid, _) => return Err(anyhow!(
+                (invalid, _, _) => return Err(anyhow!(
                     "this is actually the very first time someone thought to call {} on an array.", invalid
                 )),
             };
@@ -524,14 +520,7 @@ impl Interpreter {
 }
 
 fn run(this: &mut Interpreter) -> Result<()> {
-    'outer: loop {
-        while matches!(this.call_stack.last().unwrap(), StackFrame { code_end, .. } if this.pc >= *code_end) {
-            if this.call_stack.len() == 1 {
-                break 'outer
-            }
-            this.perform_return()?;
-        }
-
+    while !this.call_stack.is_empty() && this.pc < this.call_stack.last().unwrap().code_end {
         #[cfg(debug_assertions)]
         {
             println!("\tstack: {:?}", this.stack);

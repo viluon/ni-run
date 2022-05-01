@@ -81,6 +81,8 @@ impl Compiler {
     }
 
     fn finalise_function(&mut self, n_args: u8) -> Result<u16> {
+        self.emit(Instr::Return)?;
+
         let name_idx = self.fetch_or_add_constant(Constant::String(self.current_proto.name.clone()));
         let pos = self.current_proto.k;
         self.constant_pool[pos as usize] = Constant::Method {
@@ -288,8 +290,8 @@ impl Compiler {
             },
             AST::AssignArray { array, index, value } => {
                 self.compile_node(array)?;
-                self.compile_node(value)?;
                 self.compile_node(index)?;
+                self.compile_node(value)?;
                 let set = self.fetch_or_add_constant(Constant::String("set".to_string()));
                 self.emit(CallMethod(set, 3))?;
             },
@@ -387,9 +389,9 @@ impl Compiler {
         self.emit(Label(start))?;
         {
             self.emit(GetLocal(arr))?;
+            self.emit(GetLocal(arr_i))?;
             self.compile_node(value)?;
             // call the set method on the local array
-            self.emit(GetLocal(arr_i))?;
             self.emit(CallMethod(set, 3))?;
             self.emit(GetLocal(arr_i))?;
             self.emit(one)?;
@@ -461,7 +463,9 @@ impl Compiler {
 }
 
 fn main() -> Result<()> {
-    let ast = serde_json::from_reader(std::io::stdin())?;
+    let mut desr = serde_json::Deserializer::from_reader(std::io::stdin());
+    desr.disable_recursion_limit();
+    let ast = desr.into_iter().next().unwrap()?;
     let mut c = Compiler::new();
     c.compile(&ast)?;
     let buf = c.assemble()?;
