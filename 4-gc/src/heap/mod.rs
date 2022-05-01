@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use itertools::Itertools;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -93,7 +92,7 @@ pub enum Value {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeapObject {
     Array(Vec<Value>), // TODO: copy on write?
-    Object { parent: Value, fields: Vec<(u16, Value)>, methods: HashMap<u16, u16> },
+    Object { parent: Value, fields: Vec<(u16, Value)>, methods: Vec<(u16, u16)> },
 }
 
 pub enum HeapTag {
@@ -218,7 +217,7 @@ impl From<&[u8]> for HeapObject {
                 let len_methods = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
                 let mut bytes = &bytes[24..];
                 let mut fields = Vec::with_capacity(len_fields);
-                let mut methods = HashMap::with_capacity(len_methods);
+                let mut methods = Vec::with_capacity(len_methods);
                 for _ in 0..len_fields {
                     let key = u16::from_le_bytes(bytes[..2].try_into().unwrap());
                     let value = Value::from_le_bytes(bytes[2..10].try_into().unwrap());
@@ -228,7 +227,7 @@ impl From<&[u8]> for HeapObject {
                 for _ in 0..len_methods {
                     let key = u16::from_le_bytes(bytes[..2].try_into().unwrap());
                     let value = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
-                    methods.insert(key, value);
+                    methods.push((key, value));
                     bytes = &bytes[4..];
                 }
                 HeapObject::Object { parent, fields, methods }

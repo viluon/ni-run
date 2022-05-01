@@ -172,9 +172,11 @@ impl Interpreter {
             }
         };
 
-        match methods.get(&name) {
-            Some(&i) => {
-                let (_name, n_args, n_locals, start, len) = self.constant_pool[i as usize].as_method()?;
+        let index = methods.binary_search_by_key(&name, |p| p.0).ok();
+        match index {
+            Some(i) => {
+                let method_idx = methods[i].1 as usize;
+                let (_name, n_args, n_locals, start, len) = self.constant_pool[method_idx].as_method()?;
                 (n_args as usize == args.len() + 1).expect(|| anyhow!(
                     "wrong number of arguments, {} expects {}, not {} (receiver and {:?})", name, n_args, args.len() + 1, args
                 ))?;
@@ -578,12 +580,13 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 }
 
                 fields.sort_by_key(|p| p.0);
+                methods.sort_by_key(|p| p.0);
 
                 let parent = this.pop()?;
                 let obj = HeapObject::Object {
                     parent,
                     fields,
-                    methods: methods.into_iter().collect(),
+                    methods,
                 };
 
                 let ptr = this.heap.alloc(&obj)?;
