@@ -79,19 +79,19 @@ impl Heap {
     }
 }
 
-// #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-// #[repr(packed(1))]
-// pub struct UnalignedPointer(u16, u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(packed(2))]
+pub struct UnalignedPointer(u16, u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-// pub struct Pointer(UnalignedPointer);
-pub struct Pointer(u16, u32);
+#[repr(align(4))]
+pub struct Pointer(UnalignedPointer);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Int(i32),
     Bool(bool),
-    Reference(Pointer),
+    Reference(UnalignedPointer),
     Null,
 }
 
@@ -100,7 +100,7 @@ pub type ObjectMethods = SmallVec<[(u16, u16); 6]>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeapObject {
-    Array(SmallVec<[Value; 9]>),
+    Array(SmallVec<[Value; 8]>),
     Object { parent: Value, fields: ObjectFields, methods: ObjectMethods },
 }
 
@@ -130,9 +130,9 @@ impl Value {
     }
 }
 
-impl Pointer {
-    fn from_le_bytes(bytes: &[u8; 6]) -> Pointer {
-        Pointer(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), u32::from_le_bytes(bytes[2..6].try_into().unwrap()))
+impl UnalignedPointer {
+    fn from_le_bytes(bytes: &[u8; 6]) -> UnalignedPointer {
+        UnalignedPointer(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), u32::from_le_bytes(bytes[2..6].try_into().unwrap()))
     }
 
     fn to_le_bytes(self) -> [u8; 6] {
@@ -142,15 +142,39 @@ impl Pointer {
     }
 }
 
+impl From<u64> for UnalignedPointer {
+    fn from(addr: u64) -> UnalignedPointer {
+        UnalignedPointer((addr >> 32) as u16, addr as u32)
+    }
+}
+
+impl From<UnalignedPointer> for u64 {
+    fn from(ptr: UnalignedPointer) -> u64 {
+        (ptr.0 as u64) << 32 | (ptr.1 as u64)
+    }
+}
+
+impl From<UnalignedPointer> for Pointer {
+    fn from(ptr: UnalignedPointer) -> Pointer {
+        Pointer(ptr)
+    }
+}
+
+impl From<Pointer> for UnalignedPointer {
+    fn from(ptr: Pointer) -> UnalignedPointer {
+        ptr.0
+    }
+}
+
 impl From<u64> for Pointer {
     fn from(addr: u64) -> Pointer {
-        Pointer((addr >> 32) as u16, addr as u32)
+        Pointer(UnalignedPointer::from(addr))
     }
 }
 
 impl From<Pointer> for u64 {
     fn from(ptr: Pointer) -> u64 {
-        (ptr.0 as u64) << 32 | (ptr.1 as u64)
+        ptr.0.into()
     }
 }
 
@@ -190,7 +214,7 @@ impl From<&[u8]> for Value {
             1 => Value::Int(i32::from_le_bytes(bytes[..4].try_into().unwrap())),
             2 => Value::Bool(bytes[0] == 1),
             4 => Value::Null,
-            5 => Value::Reference(Pointer::from_le_bytes(bytes[..6].try_into().unwrap())),
+            5 => Value::Reference(UnalignedPointer::from_le_bytes(bytes[..6].try_into().unwrap())),
             _ => panic!("Invalid value tag"),
         }
     }
@@ -263,7 +287,7 @@ impl Value {
 
     pub fn as_reference<F: FnOnce(&Value) -> anyhow::Error>(&self, err: F) -> Result<Pointer> {
         match self {
-            Value::Reference(p) => Ok(*p),
+            Value::Reference(p) => Ok(Pointer(*p)),
             v => Err(err(v)),
         }
     }
@@ -280,12 +304,13 @@ mod tests {
     #[test]
     fn verify_type_sizes() {
         use std::mem::size_of;
+        assert_eq!(size_of::<UnalignedPointer>(), 6);
         assert_eq!(size_of::<Pointer>(), 8);
-        assert_eq!(size_of::<Value>(), 12);
-        assert_eq!(size_of::<ObjectFields>(), 80);
+        assert_eq!(size_of::<Value>(), 8);
+        assert_eq!(size_of::<ObjectFields>(), 64);
         assert_eq!(size_of::<ObjectMethods>(), 40);
         assert_eq!(size_of::<Vec<Value>>(), 24);
-        assert_eq!(size_of::<HeapObject>(), 136);
+        assert_eq!(size_of::<HeapObject>(), 120);
         assert_eq!(size_of::<HeapTag>(), 16);
     }
 }

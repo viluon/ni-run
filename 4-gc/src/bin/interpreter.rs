@@ -157,6 +157,7 @@ impl Interpreter {
                 Ok(())
             },
             Value::Reference(ptr) => {
+                let ptr: Pointer = ptr.into();
                 match self.heap.read_tag(ptr)? {
                     HeapTag::Array(len) => self.call_array_method(name, &args, len as i32, ptr),
                     HeapTag::Object => self.call_object_method(ptr, name, args, receiver),
@@ -241,7 +242,7 @@ impl Interpreter {
                 Value::Null => "null".to_string(),
                 Value::Int(n) => n.to_string(),
                 Value::Bool(b) => b.to_string(),
-                &Value::Reference(ptr) => go_obj(this, depth + 1, &this.heap.read(ptr).unwrap()),
+                &Value::Reference(ptr) => go_obj(this, depth + 1, &this.heap.read(ptr.into()).unwrap()),
             }
         }
 
@@ -553,7 +554,7 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 (len >= 0).expect(|| anyhow!("the length of an array must be non-negative"))?;
                 let len = len as usize;
                 let ptr = this.heap.alloc(&HeapObject::Array(smallvec![initial; len]))?;
-                this.push(Value::Reference(ptr))
+                this.push(Value::Reference(ptr.into()))
             },
             Instr::Object(class) => {
                 // FIXME do this all in a single loop
@@ -591,7 +592,7 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 };
 
                 let ptr = this.heap.alloc(&obj)?;
-                this.push(Value::Reference(ptr))
+                this.push(Value::Reference(ptr.into()))
             },
         }?;
 
