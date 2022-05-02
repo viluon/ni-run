@@ -1,6 +1,7 @@
 use itertools::Itertools;
 use anyhow::Result;
 use anyhow::anyhow;
+use smallvec::SmallVec;
 
 use crate::util::BooleanAssertions;
 
@@ -78,7 +79,12 @@ impl Heap {
     }
 }
 
+// #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// #[repr(packed(1))]
+// pub struct UnalignedPointer(u16, u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// pub struct Pointer(UnalignedPointer);
 pub struct Pointer(u16, u32);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,10 +95,13 @@ pub enum Value {
     Null,
 }
 
+pub type ObjectFields = SmallVec<[(u16, Value); 4]>;
+pub type ObjectMethods = SmallVec<[(u16, u16); 6]>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeapObject {
-    Array(Vec<Value>), // TODO: copy on write?
-    Object { parent: Value, fields: Vec<(u16, Value)>, methods: Vec<(u16, u16)> },
+    Array(SmallVec<[Value; 9]>),
+    Object { parent: Value, fields: ObjectFields, methods: ObjectMethods },
 }
 
 pub enum HeapTag {
@@ -205,7 +214,7 @@ impl From<&[u8]> for HeapObject {
         match tag {
             3 => HeapObject::Array({
                 let len = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                let mut v = Vec::with_capacity(len as usize);
+                let mut v = SmallVec::with_capacity(len as usize);
                 for i in 1..=len as usize {
                     v.push(Value::from_le_bytes(bytes[(i * 8)..((i + 1) * 8)].try_into().unwrap()));
                 }
@@ -216,8 +225,8 @@ impl From<&[u8]> for HeapObject {
                 let len_fields = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
                 let len_methods = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
                 let mut bytes = &bytes[24..];
-                let mut fields = Vec::with_capacity(len_fields);
-                let mut methods = Vec::with_capacity(len_methods);
+                let mut fields = SmallVec::with_capacity(len_fields);
+                let mut methods = SmallVec::with_capacity(len_methods);
                 for _ in 0..len_fields {
                     let key = u16::from_le_bytes(bytes[..2].try_into().unwrap());
                     let value = Value::from_le_bytes(bytes[2..10].try_into().unwrap());
@@ -261,5 +270,22 @@ impl Value {
 
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Bool(false) | Value::Null)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_type_sizes() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<Pointer>(), 8);
+        assert_eq!(size_of::<Value>(), 12);
+        assert_eq!(size_of::<ObjectFields>(), 80);
+        assert_eq!(size_of::<ObjectMethods>(), 40);
+        assert_eq!(size_of::<Vec<Value>>(), 24);
+        assert_eq!(size_of::<HeapObject>(), 136);
+        assert_eq!(size_of::<HeapTag>(), 16);
     }
 }

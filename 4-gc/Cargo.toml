@@ -10,6 +10,7 @@ anyhow = "1.0.37"
 itertools = "0.10.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["unbounded_depth"] }
+smallvec = "1.8.0"
 
 [dev-dependencies]
 quickcheck = "1"

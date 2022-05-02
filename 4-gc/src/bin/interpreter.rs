@@ -11,6 +11,7 @@ use anyhow::anyhow;
 use fml_gc::*;
 use bc::*;
 use heap::*;
+use smallvec::smallvec;
 
 const STACK_LIMIT: usize = 1024;
 
@@ -551,7 +552,7 @@ fn run(this: &mut Interpreter) -> Result<()> {
 
                 (len >= 0).expect(|| anyhow!("the length of an array must be non-negative"))?;
                 let len = len as usize;
-                let ptr = this.heap.alloc(&HeapObject::Array(vec![initial; len]))?;
+                let ptr = this.heap.alloc(&HeapObject::Array(smallvec![initial; len]))?;
                 this.push(Value::Reference(ptr))
             },
             Instr::Object(class) => {
@@ -569,8 +570,8 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 members.sort_by_key(|p| p.0);
                 members.reverse();
 
-                let mut fields = vec![];
-                let mut methods = vec![];
+                let mut fields: ObjectFields = Default::default();
+                let mut methods: ObjectMethods = Default::default();
                 for (method_index, slot) in members.into_iter() {
                     match slot {
                         Constant::Slot(i) => fields.push((i, this.pop()?)),
@@ -662,7 +663,7 @@ mod test {
 
         let i = dummy();
         let mut h = i.heap;
-        let arr = h.alloc(&Array(vec![Null; 10]))?;
+        let arr = h.alloc(&Array(smallvec![Null; 10]))?;
 
         let int1 = Int(1);
         let int2 = Int(-2);

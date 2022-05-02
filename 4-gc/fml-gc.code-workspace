@@ -29,7 +29,8 @@
 		},
 		"peacock.color": "#2e234a",
 		"cSpell.words": [
-			"Instr"
+			"Instr",
+			"smallvec"
 		]
 	}
 }
