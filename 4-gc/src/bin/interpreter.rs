@@ -28,7 +28,7 @@ struct StackFrame {
 struct Interpreter {
     constant_pool: Vec<Constant>,
     label_map: HashMap<String, Pc>,
-    // the values are both heap addresses and constant pool indices,
+    // the values are both values and constant pool indices,
     // depending on whether the global is a variable or a function
     global_map: HashMap<u16, Either<Value, u16>>,
     code: Vec<Instr>,
@@ -121,6 +121,17 @@ impl Interpreter {
 
     fn peek(&self) -> Result<Value> {
         self.stack.last().cloned().ok_or_else(|| anyhow!("stack underflow"))
+    }
+
+    fn alloc(&mut self, obj: &HeapObject) -> Result<Pointer> {
+        if self.heap.should_gc_before_alloc(obj) {
+            self.heap.gc(self.stack.iter().filter_map(|v| match v {
+                &Value::Reference(p) => Some(p),
+                _ => None,
+            }).collect_vec())?;
+        }
+
+        self.heap.alloc_after_gc(obj)
     }
 
     fn execute(&mut self) -> Result<()> {
@@ -552,7 +563,7 @@ fn run(this: &mut Interpreter) -> Result<()> {
 
                 (len >= 0).expect(|| anyhow!("the length of an array must be non-negative"))?;
                 let len = len as usize;
-                let ptr = this.heap.alloc(&HeapObject::Array(smallvec![initial; len]))?;
+                let ptr = this.alloc(&HeapObject::Array(smallvec![initial; len]))?;
                 this.push(Value::Reference(ptr))
             },
             Instr::Object(class) => {
@@ -590,7 +601,7 @@ fn run(this: &mut Interpreter) -> Result<()> {
                     methods,
                 };
 
-                let ptr = this.heap.alloc(&obj)?;
+                let ptr = this.alloc(&obj)?;
                 this.push(Value::Reference(ptr))
             },
         }?;
@@ -661,9 +672,9 @@ mod test {
         use HeapObject::Array;
         use Value::*;
 
-        let i = dummy();
+        let mut i = dummy();
+        let arr = i.alloc(&Array(smallvec![Null; 10]))?;
         let mut h = i.heap;
-        let arr = h.alloc(&Array(smallvec![Null; 10]))?;
 
         let int1 = Int(1);
         let int2 = Int(-2);

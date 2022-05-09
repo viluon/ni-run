@@ -1,3 +1,8 @@
+pub mod gc;
+
+use std::collections::HashMap;
+use std::num::NonZeroU64;
+
 use itertools::Itertools;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -5,12 +10,30 @@ use smallvec::SmallVec;
 
 use crate::util::BooleanAssertions;
 
-#[derive(Debug, Default)]
-pub struct Heap(Vec<u8>);
+#[derive(Debug, Default, Clone)]
+pub struct Heap {
+    capacity: Option<NonZeroU64>,
+    store: Vec<u8>,
+}
 
 impl Heap {
-    pub fn alloc(&mut self, obj: &HeapObject) -> Result<Pointer> {
-        let addr = self.0.len();
+    pub fn should_gc_before_alloc(&self, obj: &HeapObject) -> bool {
+        self.capacity.map(|cap|
+            (self.store.len() + obj.size()) as f32 > (gc::GC_THRESHOLD * cap.get() as f32)
+        ).unwrap_or(false)
+    }
+
+    pub fn gc(&mut self, roots: Vec<Pointer>) -> Result<()> {
+        let new = gc::run_gc(self, roots)?;
+        self.store = new.store;
+        self.capacity = new.capacity;
+        Ok(())
+    }
+
+    /// Unfortunately, this function doesn't trigger garbage collection,
+    /// since the GC roots come from the interpreter.
+    pub fn alloc_after_gc(&mut self, obj: &HeapObject) -> Result<Pointer> {
+        let addr = self.store.len();
         self.set(addr, obj)?;
         Ok(Pointer::from(addr as u64))
     }
@@ -18,21 +41,21 @@ impl Heap {
     pub fn read(&self, addr: Pointer) -> Result<HeapObject> {
         let addr: u64 = addr.into();
         let addr = addr as usize;
-        if addr < self.0.len() {
-            Ok(HeapObject::from(&self.0[addr..]))
+        if addr < self.store.len() {
+            Ok(HeapObject::from(&self.store[addr..]))
         } else { Err(anyhow!("invalid address: {:#06x}", addr)) }
     }
 
     pub fn read_tag(&self, addr: Pointer) -> Result<HeapTag> {
         let addr: u64 = addr.into();
         let addr = addr as usize;
-        if addr < self.0.len() {
-            Ok(HeapTag::from(&self.0[addr..]))
+        if addr < self.store.len() {
+            Ok(HeapTag::from(&self.store[addr..]))
         } else { Err(anyhow!("invalid address: {:#06x}", addr)) }
     }
 
     pub fn array_set(&mut self, arr: Pointer, i: u32, v: Value) -> Result<()> {
-        let heap = self.0.as_mut_slice();
+        let heap = self.store.as_mut_slice();
         let arr: u64 = arr.into();
         let offset = arr as usize + 1 + 8 + i as usize * 8;
         (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
@@ -41,7 +64,7 @@ impl Heap {
     }
 
     pub fn array_get(&self, arr: Pointer, i: u32) -> Result<Value> {
-        let heap = self.0.as_slice();
+        let heap = self.store.as_slice();
         let arr: u64 = arr.into();
         let offset = arr as usize + 1 + 8 + i as usize * 8;
         (offset + 8 <= heap.len()).expect(|| anyhow!("array index out of bounds"))?;
@@ -63,7 +86,7 @@ impl Heap {
                     + 24 // parent, field and method counts
                     + index as usize * 10 // field index
                     + 2; // skip key
-                Ok(self.0[field_value_addr .. field_value_addr + 8].as_mut())
+                Ok(self.store[field_value_addr .. field_value_addr + 8].as_mut())
             },
             _ => Err(anyhow!("not an object")),
         }
@@ -71,20 +94,19 @@ impl Heap {
 
     fn set(&mut self, addr: usize, obj: &HeapObject) -> Result<()> {
         let repr: Vec<u8> = obj.into();
-        if self.0.len() < addr + repr.len() {
-            self.0.resize(addr + repr.len(), 0);
+        if self.store.len() < addr + repr.len() {
+            if self.capacity.map(|n| (n.get() as usize) < addr + repr.len()).unwrap_or(true) {
+                self.store.resize(addr + repr.len(), 0);
+            } else {
+                return Err(anyhow!("out of memory"));
+            }
         }
-        self.0[addr..addr + repr.len()].copy_from_slice(&repr);
+        self.store[addr..addr + repr.len()].copy_from_slice(&repr);
         Ok(())
     }
 }
 
-// #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-// #[repr(packed(1))]
-// pub struct UnalignedPointer(u16, u32);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-// pub struct Pointer(UnalignedPointer);
 pub struct Pointer(u16, u32);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +229,37 @@ impl From<&[u8]> for HeapTag {
     }
 }
 
+impl HeapObject {
+    pub fn replace_ptrs(self, rename_map: &HashMap<Pointer, Pointer>) -> Self {
+        let patch_value = |v| match v {
+            Value::Reference(p) => Value::Reference(rename_map[&p]),
+            _ => v,
+        };
+        match self {
+            HeapObject::Array(v) =>
+                HeapObject::Array(v.into_iter().map(|x| patch_value(x)).collect()),
+            HeapObject::Object { parent, fields, methods } =>
+                HeapObject::Object {
+                    parent,
+                    fields: fields.into_iter().map(|(k, v)| (k, patch_value(v))).collect(),
+                    methods
+                },
+        }
+    }
+
+    // The size of this object on the heap.
+    pub fn size(&self) -> usize {
+        use HeapObject::*;
+        1 + match self {
+            Array(arr) =>
+                8 + arr.len() * 8,
+            Object { parent: _, fields, methods } =>
+                3 * 8 + fields.len() * (2 + 8) + methods.len() * (2 + 2),
+        }
+    }
+}
+
+// WARN: keep in sync with the above
 impl From<&[u8]> for HeapObject {
     fn from(bytes: &[u8]) -> Self {
         let tag = bytes[0];
