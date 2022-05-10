@@ -13,13 +13,13 @@ then
     # $PARSER execute < "$2"
 elif [ "$1" = "parse" ]
 then
-    $PARSER parse "$2" --format=json
+    $PARSER parse "$2" "$3" "$4"
 elif [ "$1" = "compile" ]
 then
     # our compiler
-    "$SCRIPT_DIR/target/release/compiler" < "$2"
+    # "$SCRIPT_DIR/target/release/compiler" < "$2"
     # reference compiler
-    # $PARSER compile --input-format=json < "$2"
+    $PARSER compile --input-format=json < "$2"
 elif [ "$1" = "run" ]
 then
     # our compiler, our interpreter

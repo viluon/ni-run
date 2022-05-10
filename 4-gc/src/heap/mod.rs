@@ -3,6 +3,7 @@ pub mod gc;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 
+use anyhow::Context;
 use itertools::Itertools;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -10,29 +11,62 @@ use smallvec::SmallVec;
 
 use crate::util::BooleanAssertions;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Heap {
     capacity: Option<NonZeroU64>,
     store: Vec<u8>,
+    pub log: Option<String>,
+}
+
+fn actual_capacity(capacity: Option<NonZeroU64>) -> usize {
+    capacity.map_or(0, |c| c.get() as usize)
 }
 
 impl Heap {
-    pub fn should_gc_before_alloc(&self, obj: &HeapObject) -> bool {
-        self.capacity.map(|cap|
-            (self.store.len() + obj.size()) as f32 > (gc::GC_THRESHOLD * cap.get() as f32)
-        ).unwrap_or(false)
+    pub fn with_capacity(capacity: Option<NonZeroU64>) -> Self {
+        Self {
+            capacity,
+            log: None,
+            store: Vec::with_capacity(actual_capacity(capacity)),
+        }
     }
 
-    pub fn gc(&mut self, roots: Vec<Pointer>) -> Result<()> {
-        let new = gc::run_gc(self, roots)?;
+    pub fn trace(&self, event: String) {
+        use std::io::Write;
+        if let Some(ref path) = self.log {
+            // append a new row to the log file
+            // in the format timestamp, event, heap size
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+            let timestamp = timestamp.as_secs() as u64 * 1000 + timestamp.subsec_nanos() as u64 / 1_000_000;
+            let heap_size = self.store.len() as u64;
+            writeln!(file, "{},{},{}", timestamp, event, heap_size).unwrap();
+        }
+    }
+
+    pub fn should_gc_before_alloc(&self, obj: &HeapObject) -> bool {
+        self.capacity.map_or(false, |cap|
+            (self.store.len() + obj.size()) as f32 > (gc::GC_THRESHOLD * cap.get() as f32)
+        )
+    }
+
+    pub fn gc(&mut self, roots: Vec<Pointer>) -> Result<gc::RenameMap> {
+        self.trace(format!("gc start with {} roots", roots.len()));
+        let (new, rename) = gc::run_gc(self, roots)?;
         self.store = new.store;
         self.capacity = new.capacity;
-        Ok(())
+        self.trace("gc end".to_string());
+        Ok(rename)
     }
 
     /// Unfortunately, this function doesn't trigger garbage collection,
     /// since the GC roots come from the interpreter.
     pub fn alloc_after_gc(&mut self, obj: &HeapObject) -> Result<Pointer> {
+        self.trace("alloc".to_string());
         let addr = self.store.len();
         self.set(addr, obj)?;
         Ok(Pointer::from(addr as u64))
@@ -50,7 +84,8 @@ impl Heap {
         let addr: u64 = addr.into();
         let addr = addr as usize;
         if addr < self.store.len() {
-            Ok(HeapTag::from(&self.store[addr..]))
+            HeapTag::try_from(&self.store[addr..])
+                .with_context(|| format!("invalid tag at {}", addr))
         } else { Err(anyhow!("invalid address: {:#06x}", addr)) }
     }
 
@@ -94,8 +129,9 @@ impl Heap {
 
     fn set(&mut self, addr: usize, obj: &HeapObject) -> Result<()> {
         let repr: Vec<u8> = obj.into();
+        assert_eq!(repr.len(), obj.size());
         if self.store.len() < addr + repr.len() {
-            if self.capacity.map(|n| (n.get() as usize) < addr + repr.len()).unwrap_or(true) {
+            if self.capacity.map_or(true, |n| (n.get() as usize) > addr + repr.len()) {
                 self.store.resize(addr + repr.len(), 0);
             } else {
                 return Err(anyhow!("out of memory"));
@@ -218,32 +254,35 @@ impl From<&[u8]> for Value {
     }
 }
 
-impl From<&[u8]> for HeapTag {
-    fn from(bytes: &[u8]) -> Self {
+impl TryFrom<&[u8]> for HeapTag {
+    type Error = anyhow::Error;
+
+    fn try_from(bytes: &[u8]) -> Result<Self> {
         let tag = bytes[0];
         match tag {
-            3 => HeapTag::Array(u64::from_le_bytes(bytes[1..9].try_into().unwrap())),
-            6 => HeapTag::Object,
-            _ => panic!("Invalid heap tag"),
+            3 => Ok(HeapTag::Array(u64::from_le_bytes(bytes[1..9].try_into().unwrap()))),
+            6 => Ok(HeapTag::Object),
+            invalid => Err(anyhow!("Invalid heap tag {}", invalid)),
         }
     }
 }
 
 impl HeapObject {
-    pub fn replace_ptrs(self, rename_map: &HashMap<Pointer, Pointer>) -> Self {
-        let patch_value = |v| match v {
-            Value::Reference(p) => Value::Reference(rename_map[&p]),
-            _ => v,
-        };
+    pub fn replace_ptrs(mut self, rename_map: &HashMap<Pointer, Pointer>) -> Self {
+        self.modify_ptrs(|ptr| *ptr = rename_map[ptr]);
+        self
+    }
+
+    pub fn modify_ptrs<F>(&mut self, mut f: F) where F: FnMut(&mut Pointer) {
+        let mut patch_value =
+            |v: &mut Value| if let Value::Reference(p) = v { f(p) };
+
         match self {
-            HeapObject::Array(v) =>
-                HeapObject::Array(v.into_iter().map(|x| patch_value(x)).collect()),
-            HeapObject::Object { parent, fields, methods } =>
-                HeapObject::Object {
-                    parent,
-                    fields: fields.into_iter().map(|(k, v)| (k, patch_value(v))).collect(),
-                    methods
-                },
+            HeapObject::Array(v) => v.iter_mut().for_each(patch_value),
+            HeapObject::Object { parent, fields, methods: _ } => {
+                patch_value(parent);
+                fields.iter_mut().for_each(|(_k, v)| patch_value(v))
+            },
         }
     }
 
@@ -294,7 +333,7 @@ impl From<&[u8]> for HeapObject {
                 }
                 HeapObject::Object { parent, fields, methods }
             },
-            _ => panic!("Invalid heap object tag"),
+            invalid => panic!("Invalid heap object tag {}", invalid),
         }
     }
 }

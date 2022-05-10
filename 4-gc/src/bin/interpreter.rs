@@ -1,12 +1,14 @@
 #![feature(fn_traits, associated_type_defaults)]
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU64;
 use fml_gc::util::BooleanAssertions;
 use itertools::Itertools;
 use itertools::Either;
 use itertools::Either::{Left, Right};
 use anyhow::Result;
 use anyhow::anyhow;
+use clap::Parser;
 
 use fml_gc::*;
 use bc::*;
@@ -24,7 +26,6 @@ struct StackFrame {
     return_address: Pc,
 }
 
-#[derive(Default)]
 struct Interpreter {
     constant_pool: Vec<Constant>,
     label_map: HashMap<String, Pc>,
@@ -39,7 +40,7 @@ struct Interpreter {
 }
 
 impl Interpreter {
-    fn load<B: std::io::Read>(buf: &mut B) -> Result<Interpreter> {
+    fn load<B: std::io::Read>(buf: &mut B, heap_log: Option<String>, heap_size: Option<NonZeroU64>) -> Result<Interpreter> {
         let mut input = Vec::new();
         buf.read_to_end(&mut input)?;
         let mut iter = input.iter();
@@ -58,13 +59,15 @@ impl Interpreter {
         let mut init = Interpreter {
             stack: vec![],
             call_stack: vec![],
-            heap: Default::default(),
+            heap: Heap::with_capacity(heap_size),
             global_map: Default::default(),
             constant_pool,
             label_map,
             code,
             pc,
         };
+
+        init.heap.log = heap_log;
 
         let bottom_frame = StackFrame {
             code_end: pc + length,
@@ -125,13 +128,35 @@ impl Interpreter {
 
     fn alloc(&mut self, obj: &HeapObject) -> Result<Pointer> {
         if self.heap.should_gc_before_alloc(obj) {
-            self.heap.gc(self.stack.iter().filter_map(|v| match v {
-                &Value::Reference(p) => Some(p),
-                _ => None,
-            }).collect_vec())?;
+            self.gc()?;
         }
 
         self.heap.alloc_after_gc(obj)
+    }
+
+    fn gc(&mut self) -> Result<()> {
+        let rename = self.heap.gc(self.stack.iter().cloned()
+            .chain(self.global_map.values()
+                .filter_map(|v| v.clone().left())
+            )
+            .chain(
+                self.call_stack.iter().flat_map(|frame| frame.locals.iter().cloned())
+            ).filter_map(|v| match v {
+                Value::Reference(p) => Some(p),
+                _ => None,
+            })
+            .unique()
+            .collect_vec()
+        )?;
+        self.stack.iter_mut()
+        .chain(self.call_stack.iter_mut().flat_map(|frame| frame.locals.iter_mut()))
+        .for_each(|v| if let Value::Reference(p) = v {
+            *p = rename[p];
+        });
+        self.global_map.iter_mut().for_each(|(_k, v)| if let Left(Value::Reference(p)) = v {
+            *p = rename[p];
+        });
+        Ok(())
     }
 
     fn execute(&mut self) -> Result<()> {
@@ -532,24 +557,31 @@ fn run(this: &mut Interpreter) -> Result<()> {
                 Ok(())
             },
             Instr::CallFunction(i, n_args) => {
-                increment = false;
-                let global_name = this.constant_pool[i as usize].as_str()?;
-                let fn_addr = this.global_map.get(&i).cloned()
-                    .ok_or_else(|| anyhow!("compiler bug: global {} not found", global_name))?
-                    .right()
-                    .ok_or_else(|| anyhow!("attempt to call variable {}", global_name))?;
-
-                let (_, arity, n_locals, start, len) = this.constant_pool[fn_addr as usize].as_method()?;
-                (arity == n_args).expect(||
-                    anyhow!("arity mismatch, expected {} arguments, got {}", arity, n_args)
-                )?;
-
                 let args = (0..n_args)
                     .map(|_| this.pop())
                     .collect::<Result<Vec<_>>>()?;
 
-                this.call_function(start, start + len, n_locals, &args)?;
-                Ok(())
+                match this.constant_pool[i as usize].as_str()? {
+                    "force_gc" => {
+                        this.gc()?;
+                        this.push(Value::Null)
+                    },
+                    global_name => {
+                        increment = false;
+                        let fn_addr = this.global_map.get(&i).cloned()
+                            .ok_or_else(|| anyhow!("compiler bug: global {} not found", global_name))?
+                            .right()
+                            .ok_or_else(|| anyhow!("attempt to call variable {}", global_name))?;
+
+                        let (_, arity, n_locals, start, len) = this.constant_pool[fn_addr as usize].as_method()?;
+                        (arity == n_args).expect(||
+                            anyhow!("arity mismatch, expected {} arguments, got {}", arity, n_args)
+                        )?;
+
+                        this.call_function(start, start + len, n_locals, &args)?;
+                        Ok(())
+                    },
+                }
             },
             Instr::Return => {
                 increment = false;
@@ -612,8 +644,24 @@ fn run(this: &mut Interpreter) -> Result<()> {
     // Err(anyhow!("nope"))
 }
 
+#[derive(Parser, Debug)]
+#[clap()]
+struct Args {
+    #[clap(long)]
+    heap_size: Option<NonZeroU64>,
+
+    #[clap(long)]
+    heap_log: Option<String>,
+}
+
 fn main() -> Result<()> {
-    let mut i = Interpreter::load(&mut std::io::stdin())?;
+    let args = Args::parse();
+    let mut i = Interpreter::load(
+        &mut std::io::stdin(),
+        args.heap_log,
+        args.heap_size,
+    )?;
+
     match i.execute() {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -664,7 +712,7 @@ mod test {
             0, 0, // entry point
         ];
         let mut buf = Cursor::new(data);
-        Interpreter::load(&mut buf).unwrap()
+        Interpreter::load(&mut buf, None, None).unwrap()
     }
 
     #[test]
