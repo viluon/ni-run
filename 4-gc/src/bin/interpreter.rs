@@ -35,6 +35,7 @@ struct Interpreter {
     code: Vec<Instr>,
     stack: Vec<Value>,
     call_stack: Vec<StackFrame>,
+    should_gc: bool,
     heap: Heap,
     pc: Pc,
 }
@@ -61,6 +62,7 @@ impl Interpreter {
             call_stack: vec![],
             heap: Heap::with_capacity(heap_size),
             global_map: Default::default(),
+            should_gc: false,
             constant_pool,
             label_map,
             code,
@@ -128,7 +130,7 @@ impl Interpreter {
 
     fn alloc(&mut self, obj: &HeapObject) -> Result<Pointer> {
         if self.heap.should_gc_before_alloc(obj) {
-            self.gc()?;
+            self.should_gc = true;
         }
 
         self.heap.alloc_after_gc(obj)
@@ -412,6 +414,11 @@ fn run(this: &mut Interpreter) -> Result<()> {
             println!("i: {instr:?}", instr = this.code[this.pc]);
         }
 
+        if this.should_gc {
+            this.gc()?;
+            this.should_gc = false;
+        }
+
         let mut increment = true;
         match this.code[this.pc].clone() {
             Instr::Literal(i) => {
@@ -659,7 +666,7 @@ fn main() -> Result<()> {
     let mut i = Interpreter::load(
         &mut std::io::stdin(),
         args.heap_log,
-        args.heap_size,
+        args.heap_size.map(|n| (n.get() * 1024 * 1024).try_into().unwrap()),
     )?;
 
     match i.execute() {
@@ -671,6 +678,7 @@ fn main() -> Result<()> {
                 constant_pool,
                 global_map,
                 label_map,
+                should_gc,
                 pc,
                 stack,
                 heap: _,
@@ -682,6 +690,7 @@ fn main() -> Result<()> {
                 constant_pool = {constant_pool:?}\n\
                 global_map = {global_map:#?}\n\
                 label_map = {label_map:#?}\n\
+                should_gc = {should_gc:#?}\n\
                 pc = {pc:#?}\n\
                 stack = {stack:#?}\n\
                 ",
@@ -690,6 +699,7 @@ fn main() -> Result<()> {
                 constant_pool = constant_pool,
                 global_map = global_map,
                 label_map = label_map,
+                should_gc = should_gc,
                 pc = pc,
                 stack = stack,
             );

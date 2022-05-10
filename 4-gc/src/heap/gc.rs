@@ -81,11 +81,9 @@ fn rebuild_heap(heap: &Heap, live: Vec<(Pointer, HeapObject)>) -> Result<(Heap, 
     for (ptr, obj) in live {
         let new_ptr: u64 = rename_map[&ptr].into();
         let ptr: u64 = ptr.into();
-        heap.trace(format!("moving {} bytes from {} to {} of live object {:?}", obj.size(), ptr, new_ptr, obj));
+        heap.trace(format!("moving {} bytes from {} to {}", obj.size(), ptr, new_ptr));
 
         let mut replaced = obj.replace_ptrs(&rename_map);
-        heap.trace(format!("replaced to {:?}", replaced));
-
         replaced.modify_ptrs(|rep_ptr| {
             let rep_ptr: u64 = (*rep_ptr).into();
             assert!(rep_ptr < next_ptr as u64);
