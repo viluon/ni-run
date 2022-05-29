@@ -1,0 +1,16 @@
+function id(x) -> x;
+function three() -> 3;
+
+print("result: ~", id(id(three())));
+
+function foo(x, oof) -> begin
+    let y = oof;
+    if x then id(foo(false, y))
+    else y <- 10;
+    print("~", y);
+    y
+end;
+
+print("and\n\twhat about\n\t\t~ <- this\n\tor that -> ~", foo(true, 5), foo(false, 1));
+print("let's fail this one");
+foo(1, 2, 3)
