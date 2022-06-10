@@ -4,9 +4,9 @@ use std::io::Write;
 
 use anyhow::*;
 
-use fml_gc::ast::*;
-use fml_gc::bc::*;
-use fml_gc::util::BooleanAssertions;
+use fml_jit::ast::*;
+use fml_jit::bc::*;
+use fml_jit::util::BooleanAssertions;
 use itertools::Either;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -24,8 +24,8 @@ enum Constant {
 struct Prototype {
     is_method: bool, // true if the prototype is a method (takes a receiver)
     k: u16, // index into the constant pool
-         // at which the method will be stored
-         // after compilation
+            // at which the method will be stored
+            // after compilation
     name: String,
     params: Vec<String>,
     body: Box<AST>,
@@ -98,7 +98,7 @@ impl Compiler {
     }
 
     fn assemble(mut self) -> Result<Vec<u8>> {
-        use fml_gc::bc::Constant as K;
+        use fml_jit::bc::Constant as K;
         let mut pool = vec![];
         let mut code = vec![];
 

@@ -1,0 +1,20 @@
+{
+    "configurations": [
+        {
+            "type": "cppdbg",
+            "request": "launch",
+            "name": "Open a core dump(c/c++)",
+            "program": "${workspaceFolder}/target/debug/test-asm",
+            "coreDumpPath": "${workspaceFolder}/${input:coreFileName}",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "coreFileName",
+            "type": "promptString",
+            "description": "Enter core file path"
+        }
+    ]
+}

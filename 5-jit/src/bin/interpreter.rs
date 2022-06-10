@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
-use fml_gc::util::BooleanAssertions;
+use fml_jit::util::BooleanAssertions;
 use itertools::Itertools;
 use itertools::Either;
 use itertools::Either::{Left, Right};
@@ -10,7 +10,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
 
-use fml_gc::*;
+use fml_jit::*;
 use bc::*;
 use heap::*;
 use smallvec::smallvec;
@@ -648,7 +648,6 @@ fn run(this: &mut Interpreter) -> Result<()> {
         this.pc += increment as usize;
     };
     Ok(())
-    // Err(anyhow!("nope"))
 }
 
 #[derive(Parser, Debug)]
