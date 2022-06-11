@@ -8,5 +8,6 @@ extern crate quickcheck_macros;
 pub mod ast;
 pub mod bc;
 pub mod heap;
+pub mod interpreter;
 pub mod jit;
 pub mod util;

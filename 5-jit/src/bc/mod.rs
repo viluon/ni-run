@@ -3,6 +3,7 @@ use anyhow::anyhow;
 use itertools::Itertools;
 use std::collections::HashMap;
 
+use crate::heap::Value;
 use crate::util::*;
 
 /*
@@ -79,6 +80,40 @@ pub enum Instr {
     Object(u16),
 }
 
+impl Instr {
+    /// Whether this instruction could perform allocation.
+    pub fn could_alloc(&self) -> bool {
+        match self {
+            Instr::Literal(_)         |
+            Instr::LiteralNull        |
+            Instr::LiteralBool(_)     |
+            Instr::LiteralInt(_)      |
+            Instr::Drop               |
+            Instr::Print(_, _)        |
+            Instr::GetLocal(_)        |
+            Instr::SetLocal(_)        |
+            Instr::GetGlobal(_)       |
+            Instr::GetGlobalDirect(_) |
+            Instr::SetGlobal(_)       |
+            Instr::SetGlobalDirect(_) |
+            Instr::GetField(_)        |
+            Instr::GetFieldDirect(_)  |
+            Instr::SetField(_)        |
+            Instr::SetFieldDirect(_)  |
+            Instr::Label(_)           |
+            Instr::Jump(_)            |
+            Instr::JumpDirect(_)      |
+            Instr::Branch(_)          |
+            Instr::BranchDirect(_)    |
+            Instr::CallFunction(_, _) |
+            Instr::CallMethod(_, _)   |
+            Instr::Return             => false,
+            Instr::Array              |
+            Instr::Object(_)          => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Constant {
     Null,
@@ -124,6 +159,18 @@ impl Constant {
         match self {
             Constant::Class { member_indices } => Ok(member_indices.clone()),
             k => Err(anyhow!("expected class, got {:?}", k))
+        }
+    }
+
+    pub fn as_value(&self) -> Result<Value> {
+        match self {
+            Constant::Null => Ok(Value::Null),
+            &Constant::Boolean(b) => Ok(Value::Bool(b)),
+            &Constant::Integer(i) => Ok(Value::Int(i)),
+            Constant::String(_) => Err(anyhow!("a string is not a stack value")),
+            Constant::Slot(_) => Err(anyhow!("a slot is not a stack value")),
+            Constant::Method { .. } => Err(anyhow!("a method is not a stack value")),
+            Constant::Class { .. } => Err(anyhow!("a class is not a stack value")),
         }
     }
 }
