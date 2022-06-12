@@ -7,6 +7,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 
 use crate::*;
+use crate::jit::CompiledChunk;
 use bc::*;
 use heap::*;
 use util::BooleanAssertions;
@@ -36,6 +37,7 @@ pub struct Interpreter {
     pub heap: Heap,
     pub pc: Pc,
     pub jit_enabled: bool,
+    pub compilation_cache: HashMap<u16, (u8, Option<CompiledChunk>)>
 }
 
 impl Interpreter {
@@ -68,6 +70,7 @@ impl Interpreter {
             code,
             pc,
             jit_enabled,
+            compilation_cache: Default::default(),
         };
 
         init.heap.log = heap_log;
@@ -177,6 +180,7 @@ impl Interpreter {
                     stack,
                     heap: _,
                     jit_enabled,
+                    compilation_cache,
                 } = self;
                 eprintln!(
                     "interpreter crash:\n\
@@ -189,6 +193,7 @@ impl Interpreter {
                     pc = {pc:#?}\n\
                     jit_enabled = {jit_enabled}\n\
                     stack = {stack:#?}\n\
+                    compilation_cache = {compilation_cache:#?}\n\
                     ",
                     call_stack = call_stack,
                     code = code,
@@ -199,6 +204,7 @@ impl Interpreter {
                     pc = pc,
                     jit_enabled = jit_enabled,
                     stack = stack,
+                    compilation_cache = compilation_cache,
                 );
                 Err(e)
             },
@@ -264,7 +270,7 @@ impl Interpreter {
                     "wrong number of arguments, {} expects {}, not {} (receiver and {:?})", name, n_args, args.len() + 1, args
                 ))?;
                 args.push(receiver);
-                self.call_function(start, start + len, n_locals, &args)
+                self.call_function(method_idx as u16, start, start + len, n_locals, &args)
             },
             None => self.call_method(parent, name, args),
         }
@@ -362,14 +368,47 @@ impl Interpreter {
         }
     }
 
-    pub fn call_function(&mut self, start: Pc, end: Pc, n_locals: u16, args: &[Value]) -> Result<()> {
+    pub fn call_function(&mut self, fn_addr: u16, start: Pc, end: Pc, n_locals: u16, args: &[Value]) -> Result<()> {
         self.call_stack.push(StackFrame {
             code_end: end,
             return_address: self.pc + 1,
             locals: args.iter().rev().chain((0..n_locals).map(|_| &Value::Null)).cloned().collect(),
         });
-        self.pc = start;
-        Ok(())
+        match self.compilation_cache
+            .entry(fn_addr)
+            .and_modify(|(call_count, _chunk)|
+                *call_count = call_count.saturating_add(1)
+            )
+            .or_insert((1, None)) {
+            &mut (call_count, _) if call_count < jit::CALL_THRESHOLD || !self.jit_enabled => {
+                // interpret by jumping to the start
+                self.pc = start;
+                Ok(())
+            },
+            (call_count, maybe_chunk@None) => {
+                // we've hit the threshold, compile and call
+                self.heap.trace(format!(
+                    "compiling function {} to machine code, {} instructions (call count: {})",
+                    fn_addr,
+                    end - start,
+                    *call_count,
+                ));
+                let (dbg, chunk) = jit::compile(start, &self.code[start..end])?;
+                *maybe_chunk = Some(chunk);
+                self.heap.trace(format!(
+                    "compilation of function {} succeded:{}",
+                    fn_addr,
+                    dbg,
+                ));
+                unsafe { maybe_chunk.as_ref().unwrap().1(); }
+                Ok(())
+            },
+            (_, Some(chunk)) => {
+                // we have a compiled chunk already, just call it
+                unsafe { chunk.1(); }
+                Ok(())
+            },
+        }
     }
 
     pub fn raw_field(&mut self, ptr: Pointer, name: u16) -> Result<&mut [u8/*; 8*/]> {
@@ -551,7 +590,7 @@ impl Interpreter {
         (arity == n_args).expect(||
             anyhow!("arity mismatch, expected {} arguments, got {}", arity, n_args)
         )?;
-        self.call_function(start, start + len, n_locals, &args)
+        self.call_function(fn_addr, start, start + len, n_locals, &args)
     }
 }
 

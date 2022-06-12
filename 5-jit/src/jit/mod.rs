@@ -3,38 +3,21 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use assembler::*;
-use assembler::mnemonic_parameter_types::{registers::*, immediates::*, Label};
+use assembler::mnemonic_parameter_types::{registers::*, Label};
 use itertools::Itertools;
 
 use crate::bc::{Instr, Constant};
 use crate::heap::Value;
 use crate::interpreter::Interpreter;
 
+pub const CALL_THRESHOLD: u8 = 3;
 const CHUNK_LENGTH: usize = 4096;
 const LABEL_COUNT: usize = 64;
 
 pub static mut INTERPRETER: Option<*mut Interpreter> = None;
 
+#[derive(Debug)]
 pub struct CompiledChunk(ExecutableAnonymousMemoryMap, pub unsafe extern "C" fn() -> i64);
-
-impl CompiledChunk {
-    fn assemble<F>(mut code: F) -> Result<CompiledChunk>
-    where F: FnMut(&mut InstructionStream) {
-        let mut memory_map = ExecutableAnonymousMemoryMap::new(CHUNK_LENGTH, true, true)?;
-        let f = {
-            let mut instr_stream = memory_map.instruction_stream(&InstructionStreamHints {
-                number_of_labels: LABEL_COUNT,
-                ..Default::default()
-            });
-
-            let f = instr_stream.nullary_function_pointer::<i64>();
-            code(&mut instr_stream);
-            instr_stream.finish();
-            f
-        };
-        Ok(CompiledChunk(memory_map, f))
-    }
-}
 
 fn interpreter() -> &'static mut Interpreter {
     unsafe { INTERPRETER.unwrap().as_mut().unwrap() }
@@ -103,6 +86,26 @@ unsafe extern "C" fn call_function(k: i64, n_args: i64) {
     interpreter().perform_function_call(fn_addr, n_args as u8).unwrap()
 }
 
+unsafe extern "C" fn drop() {
+    interpreter().pop().unwrap();
+}
+
+unsafe extern "C" fn push_int(i: i64) {
+    interpreter().push(Value::Int(i as i32)).unwrap()
+}
+
+unsafe extern "C" fn push_bool(b: i64) {
+    interpreter().push(Value::Bool(b != 0)).unwrap()
+}
+
+unsafe extern "C" fn push_ref(a: i64) {
+    interpreter().push(Value::Reference((a as u64).into())).unwrap()
+}
+
+unsafe extern "C" fn push_null() {
+    interpreter().push(Value::Null).unwrap()
+}
+
 struct JitCompiler<'a> {
     instr_stream: InstructionStream<'a>,
     label_map: HashMap<usize, Label>,
@@ -120,7 +123,7 @@ impl<'a> JitCompiler<'a> {
             Instr::LiteralNull => self.emit_push(Value::Null),
             Instr::LiteralBool(b) => self.emit_push(Value::Bool(*b)),
             Instr::LiteralInt(i) => self.emit_push(Value::Int(*i)),
-            Instr::Drop => self.emit_pop(Register64Bit::RAX),
+            Instr::Drop => self.emit_call0(drop),
             &Instr::Print(k, n_args) => self.emit_call2(perform_print, k as i64, n_args as i64),
             Instr::GetLocal(i) => self.emit_call1(get_local, *i as i64),
             Instr::SetLocal(i) => self.emit_call1(set_local, *i as i64),
@@ -133,34 +136,42 @@ impl<'a> JitCompiler<'a> {
             Instr::SetField(i) |
             Instr::SetFieldDirect(i) => self.emit_call1(set_field, *i as i64),
             Instr::Label(_) => unreachable!("labels should be collected by the label collection pass"),
-            Instr::Jump(_) => todo!(),
-            Instr::JumpDirect(target) => self.instr_stream
-                .jmp_Label(self.label_map[target])
-                .map_err(|_| anyhow!("{}? I can't jump that far!", target)),
-            Instr::Branch(_) => todo!(),
+            &Instr::Jump(k) => self.emit_code_for(
+                &Instr::JumpDirect(interpreter().label_map[&get_constant(k)?.as_string()?])
+            ),
+            Instr::JumpDirect(target) => {
+                self.instr_stream.jmp_Label_1(self.label_map[target]);
+                Ok(())
+            },
+            &Instr::Branch(k) => self.emit_code_for(
+                &Instr::BranchDirect(interpreter().label_map[&get_constant(k)?.as_string()?])
+            ),
             Instr::BranchDirect(target) => {
                 self.emit_call0r(truthy)?;
                 self.instr_stream.mov_Register64Bit_Register64Bit_r64_rm64(Register64Bit::R12, Register64Bit::RAX);
-                self.emit_pop(Register64Bit::RAX)?;
+                self.emit_call0(drop)?;
                 self.instr_stream.cmp_Register64Bit_Immediate32Bit(Register64Bit::R12, 0_u32.into());
-                self.instr_stream
-                    .jne_Label(self.label_map[target])
-                    .map_err(|_| anyhow!("{}? I can't jump that far!", target))
+                self.instr_stream.jne_Label_1(self.label_map[target]);
+                Ok(())
             },
             &Instr::CallMethod(k, n_args) => self.emit_call2(call_method, k as i64, n_args as i64),
             &Instr::CallFunction(k, n_args) => self.emit_call2(call_function, k as i64, n_args as i64),
             Instr::Return => self.emit_call0(perform_return),
             Instr::Array => self.emit_call0(create_array),
-            Instr::Object(i) => self.emit_call1(create_object, *i as i64),
+            &Instr::Object(i) => self.emit_call1(create_object, i as i64),
         }
     }
 
-    fn emit_pop(&mut self, reg: Register64Bit) -> Result<()> {
-        todo!()
-    }
-
     fn emit_push(&mut self, v: Value) -> Result<()> {
-        todo!()
+        match v {
+            Value::Int(i) => self.emit_call1(push_int, i as i64),
+            Value::Bool(b) => self.emit_call1(push_bool, b as i64),
+            Value::Reference(addr) => {
+                let addr: u64 = addr.into();
+                self.emit_call1(push_ref, addr as i64)
+            },
+            Value::Null => self.emit_call0(push_null),
+        }
     }
 
     fn emit_call0(&mut self, f: unsafe extern "C" fn()) -> Result<()> {
@@ -197,13 +208,9 @@ impl<'a> JitCompiler<'a> {
         self.instr_stream.pop_Register64Bit_r64(Register64Bit::RAX);
         Ok(())
     }
-
-    fn assemble(&mut self) -> Result<CompiledChunk> {
-        todo!()
-    }
 }
 
-pub fn compile(offset: usize, code: &[Instr]) -> Result<CompiledChunk> {
+pub fn compile(offset: usize, code: &[Instr]) -> Result<(String, CompiledChunk)> {
     let mut mmap = ExecutableAnonymousMemoryMap::new(CHUNK_LENGTH, true, true)?;
     let mut jit = JitCompiler {
         label_map: Default::default(),
@@ -213,6 +220,7 @@ pub fn compile(offset: usize, code: &[Instr]) -> Result<CompiledChunk> {
         })
     };
 
+    let f = jit.instr_stream.nullary_function_pointer();
     jit.label_map = interpreter().label_map.values().copied().sorted()
         .map(|pos| (pos, jit.instr_stream.create_label())).collect();
 
@@ -226,7 +234,11 @@ pub fn compile(offset: usize, code: &[Instr]) -> Result<CompiledChunk> {
             jit.emit_call0(gc_check)?
         }
     }
-    jit.assemble()
+
+    jit.instr_stream.ret();
+    let dbg =  format!("{:?}", jit.instr_stream);
+    jit.instr_stream.finish();
+    Ok((dbg, CompiledChunk(mmap, f)))
 }
 
 #[cfg(test)]
@@ -234,18 +246,42 @@ mod tests {
     use super::*;
     use anyhow::Result;
 
-    fn main() -> Result<()> {
-        let chunk = CompiledChunk::assemble(|instr_stream| {
-            instr_stream.mov_Register64Bit_Immediate64Bit(Register64Bit::RAX, Immediate64Bit(0x123456789abcdef0));
-            instr_stream.ret();
-        })?;
-
-        assert_eq!(unsafe { chunk.1() }, 0x123456789abcdef0);
-        Ok(())
+    fn setup(constant_pool: &[Constant], f: fn(&mut Interpreter) -> Result<()>) -> Result<()> {
+        let mut interpreter = Interpreter {
+            constant_pool: constant_pool.into(),
+            label_map: Default::default(),
+            global_map: Default::default(),
+            code: Default::default(),
+            stack: Default::default(),
+            call_stack: Default::default(),
+            should_gc: false,
+            pc: 0,
+            heap: crate::heap::Heap::with_capacity(None),
+            jit_enabled: true,
+            compilation_cache: Default::default(),
+        };
+        unsafe {
+            INTERPRETER = Some(&mut interpreter);
+        };
+        f(&mut interpreter)
     }
 
     #[test]
-    fn test_run() -> Result<()> {
-        main()
+    fn test_addition() -> Result<()> {
+        setup(&[Constant::String("+".to_string())],
+        |interpreter| {
+            let (_, chunk) = compile(0, &[
+                Instr::LiteralInt(38),
+                Instr::LiteralInt(3),
+                Instr::Drop,
+                Instr::LiteralInt(4),
+                Instr::CallMethod(0, 2),
+            ])?;
+
+            unsafe { chunk.1(); }
+            assert_eq!(interpreter.stack.first().cloned(), Some(Value::Int(42)));
+
+            Ok(())
+        })
     }
 }
